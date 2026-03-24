@@ -1,6 +1,6 @@
 """
-金价实时监控（双源版）- 修复涨跌幅字符串比较错误
-version: 2.3
+金价实时监控（双源版）- 左右布局
+version: 2.4
 """
 
 import requests
@@ -36,34 +36,49 @@ class GoldPriceMonitor:
 
     def setup_gui(self):
         self.root.title("金价实时监控 - 浙商 & 民生")
-        self.root.attributes('-topmost', True)
+        self.root.geometry("500x250")          # 设置初始窗口大小
+        self.root.attributes('-topmost', True)  # 窗口置顶
 
-        # 浙商板块
-        tk.Label(self.root, text="【浙商金价】", font=(
-            "Arial", 12, "bold")).pack(pady=(10, 0))
+        # 创建主容器，用于放置左右两个板块
+        main_frame = tk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 左侧：浙商板块
+        left_frame = tk.Frame(main_frame, relief=tk.GROOVE, bd=2)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH,
+                        expand=True, padx=5, pady=5)
+        tk.Label(left_frame, text="【浙商金价】", font=(
+            "Arial", 14, "bold")).pack(pady=10)
         self.zsh_price_label = tk.Label(
-            self.root, text="等待数据...", font=("Arial", 14))
-        self.zsh_price_label.pack(pady=2)
+            left_frame, text="等待数据...", font=("Arial", 20))
+        self.zsh_price_label.pack(pady=10)
         self.zsh_change_label = tk.Label(
-            self.root, text="", font=("Arial", 12))
-        self.zsh_change_label.pack(pady=2)
+            left_frame, text="", font=("Arial", 14))
+        self.zsh_change_label.pack(pady=10)
 
-        # 民生板块
-        tk.Label(self.root, text="【民生金价】", font=(
-            "Arial", 12, "bold")).pack(pady=(10, 0))
+        # 右侧：民生板块
+        right_frame = tk.Frame(main_frame, relief=tk.GROOVE, bd=2)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH,
+                         expand=True, padx=5, pady=5)
+        tk.Label(right_frame, text="【民生金价】", font=(
+            "Arial", 14, "bold")).pack(pady=10)
         self.ms_price_label = tk.Label(
-            self.root, text="等待数据...", font=("Arial", 14))
-        self.ms_price_label.pack(pady=2)
-        self.ms_change_label = tk.Label(self.root, text="", font=("Arial", 12))
-        self.ms_change_label.pack(pady=2)
+            right_frame, text="等待数据...", font=("Arial", 20))
+        self.ms_price_label.pack(pady=10)
+        self.ms_change_label = tk.Label(
+            right_frame, text="", font=("Arial", 14))
+        self.ms_change_label.pack(pady=10)
 
-        # 状态栏和按钮
+        # 底部状态栏和按钮
+        bottom_frame = tk.Frame(self.root)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
         self.status_label = tk.Label(
-            self.root, text="状态: 运行中", font=("Arial", 10), fg="green")
-        self.status_label.pack(pady=10)
+            bottom_frame, text="状态: 运行中", font=("Arial", 10), fg="green")
+        self.status_label.pack(side=tk.LEFT, padx=10)
 
-        button_frame = tk.Frame(self.root)
-        button_frame.pack(pady=5)
+        button_frame = tk.Frame(bottom_frame)
+        button_frame.pack(side=tk.RIGHT, padx=10)
 
         self.stop_button = tk.Button(
             button_frame, text="停止刷新", command=self.stop_monitor)
@@ -87,7 +102,7 @@ class GoldPriceMonitor:
                 print(f"=== {source_name} 原始响应 ===")
                 print(json.dumps(data, indent=2, ensure_ascii=False))
 
-            # 两个 API 结构相同，统一解析
+            # 统一解析
             result = data.get('resultData', {})
             datas = result.get('datas', {})
             price_str = datas.get('price')
@@ -96,7 +111,6 @@ class GoldPriceMonitor:
             if price_str is None or change_str is None:
                 raise ValueError(f"{source_name} API 返回数据缺失必要字段")
 
-            # 转换为浮点数以便比较和显示
             price = float(price_str)
             change = float(change_str)
             return price, change, None
@@ -142,14 +156,12 @@ class GoldPriceMonitor:
             zsh = self.zsh_data
             ms = self.ms_data
 
-        # 更新浙商
+        # 更新浙商显示
         if zsh["error"]:
             self.zsh_price_label.config(text="获取失败")
             self.zsh_change_label.config(text="")
         elif zsh["price"] is not None:
-            # 显示价格（保留两位小数）
             self.zsh_price_label.config(text=f"{zsh['price']:.2f} 元/克")
-            # 显示涨跌额，正数带加号
             change_val = zsh["change"]
             if isinstance(change_val, (int, float)):
                 sign = "+" if change_val >= 0 else ""
@@ -161,7 +173,7 @@ class GoldPriceMonitor:
             self.zsh_price_label.config(text="等待数据...")
             self.zsh_change_label.config(text="")
 
-        # 更新民生
+        # 更新民生显示
         if ms["error"]:
             self.ms_price_label.config(text="获取失败")
             self.ms_change_label.config(text="")
