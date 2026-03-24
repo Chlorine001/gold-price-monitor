@@ -183,7 +183,7 @@ class GoldPriceMonitor:
             logger.error(f"加载配置失败: {e}")
             return AppConfig()
 
-    def save_config(self, log_success=True):
+    def save_config(self):
         """保存配置到文件"""
         try:
             # 加密密码
@@ -215,8 +215,6 @@ class GoldPriceMonitor:
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            if log_success:
-                logger.info("配置保存成功（密码已加密）")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
 
