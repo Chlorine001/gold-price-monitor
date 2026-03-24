@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 金价实时监控（悬浮窗版 + 价格预警）+ 邮件预警
-version: 6.0
+version: 6.1
 功能: 
 - 密码加密存储
+- 支持自定义预警冷却时间
 """
 
 import requests
@@ -104,6 +105,7 @@ class MailConfig:
 @dataclass
 class AppConfig:
     refresh_interval: int = DEFAULT_REFRESH_INTERVAL
+    alert_cooldown_seconds: int = ALERT_COOLDOWN_SECONDS   # 新增：预警冷却时间
     alerts: Dict[str, AlertConfig] = None
     mail: MailConfig = None
 
@@ -148,6 +150,8 @@ class GoldPriceMonitor:
             cfg = AppConfig()
             cfg.refresh_interval = data.get(
                 "refresh_interval", DEFAULT_REFRESH_INTERVAL)
+            cfg.alert_cooldown_seconds = data.get(
+                "alert_cooldown_seconds", ALERT_COOLDOWN_SECONDS)   # 新增
 
             # 加载预警配置
             for bank in ["zheshang", "minsheng"]:
@@ -194,6 +198,7 @@ class GoldPriceMonitor:
 
             data = {
                 "refresh_interval": self.config.refresh_interval,
+                "alert_cooldown_seconds": self.config.alert_cooldown_seconds,   # 新增
                 "alerts": {
                     bank: {
                         "enabled": cfg.enabled,
@@ -281,19 +286,20 @@ class GoldPriceMonitor:
         if not cfg.enabled:
             return
         bank_name = "浙商" if bank_key == "zheshang" else "民生"
+        cooldown = self.config.alert_cooldown_seconds   # 使用配置的冷却时间
 
         if cfg.upper is not None and price > cfg.upper:
-            if current_time - cfg.last_alert_upper > ALERT_COOLDOWN_SECONDS:
+            if current_time - cfg.last_alert_upper > cooldown:
                 cfg.last_alert_upper = current_time
-                self.save_config(log_success=False)
+                self.save_config()
                 logger.info(bank_name + "当前价格: " +
                             f"{price:.2f}" + " 元/克 高于上限: " + "{:.2f}".format(cfg.upper)+"元/克")
                 self.show_alert_dialog(bank_name, price, "高于上限: ", cfg.upper)
 
         if cfg.lower is not None and price < cfg.lower:
-            if current_time - cfg.last_alert_lower > ALERT_COOLDOWN_SECONDS:
+            if current_time - cfg.last_alert_lower > cooldown:
                 cfg.last_alert_lower = current_time
-                self.save_config(log_success=False)
+                self.save_config()
                 logger.info(bank_name + "当前价格: " +
                             f"{price:.2f}" + " 元/克 低于下限；" + "{:.2f}".format(cfg.upper)+"元/克")
                 self.show_alert_dialog(bank_name, price, "低于下限: ", cfg.lower)
@@ -507,6 +513,14 @@ class GoldPriceMonitor:
             0, str(self.config.refresh_interval))
         self.refresh_interval_entry.grid(row=0, column=1, sticky='w', padx=5)
 
+        # 新增冷却时间输入框
+        tk.Label(parent, text="预警冷却时间 (秒):").grid(
+            row=1, column=0, sticky='e', padx=5, pady=5)
+        self.cooldown_seconds_entry = tk.Entry(parent, width=10)
+        self.cooldown_seconds_entry.insert(
+            0, str(self.config.alert_cooldown_seconds))
+        self.cooldown_seconds_entry.grid(row=1, column=1, sticky='w', padx=5)
+
     def _save_all_settings(self, win):
         # 保存预警
         for tab_name, bank_key in [("zheshang", "zheshang"), ("minsheng", "minsheng")]:
@@ -542,9 +556,17 @@ class GoldPriceMonitor:
         except ValueError:
             self.config.refresh_interval = DEFAULT_REFRESH_INTERVAL
 
+        # 保存冷却时间
+        cooldown_str = self.cooldown_seconds_entry.get().strip()
+        try:
+            self.config.alert_cooldown_seconds = max(1, int(cooldown_str))
+        except ValueError:
+            self.config.alert_cooldown_seconds = ALERT_COOLDOWN_SECONDS
+
         self.save_config()
         win.destroy()
         logger.info("设置已保存")
+
     # ---------- 更新 GUI ----------
     def update_gui(self):
         with self.lock:
