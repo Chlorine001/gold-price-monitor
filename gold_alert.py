@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 金价实时监控--优化+日志
-version: 4.2
+version: 5.0
 功能：
 - 日志记录
 - 配置统一管理
