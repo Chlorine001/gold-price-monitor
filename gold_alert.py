@@ -1,8 +1,12 @@
+#!/usr/bin/env python3
 """
-金价实时监控（悬浮窗版 + 价格预警）+ 邮件预警
-version: 4.1
+金价实时监控--优化+日志
+version: 4.2
 功能：
-- 邮件预警
+- 日志记录
+- 配置统一管理
+- 线程安全增强
+- 异常重试机制
 """
 
 import requests
@@ -13,6 +17,13 @@ import time
 import json
 import sys
 import os
+import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+from typing import Optional, Dict, Any, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from PIL import Image, ImageDraw
 
 try:
@@ -20,62 +31,79 @@ try:
     PYSTRAY_AVAILABLE = True
 except ImportError:
     PYSTRAY_AVAILABLE = False
-    print("未安装 pystray，系统托盘功能不可用。可运行: pip install pystray pillow")
 
-# API 地址
+# ------------------ 日志配置 ------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("gold_monitor.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("GoldMonitor")
+
+# ------------------ 常量 ------------------
 ZSH_URL = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816"
 MS_URL = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice"
+DEFAULT_REFRESH_INTERVAL = 1
+ALERT_COOLDOWN_SECONDS = 8
+CONFIG_FILE = "gold_config.json"
+DEBUG = False
 
-# 配置
-DEFAULT_REFRESH_INTERVAL = 1   # 刷新间隔（秒）
-ALERT_COOLDOWN_SECONDS = 8   # 预警冷却时间（秒），同一类型预警在此时间内不重复
-CONFIG_FILE = "gold_alerts.json"
-DEBUG = False                   # 调试开关，打印原始响应
+# ------------------ 数据类 ------------------
+
+
+@dataclass
+class AlertConfig:
+    enabled: bool = True
+    upper: Optional[float] = None
+    lower: Optional[float] = None
+    last_alert_upper: float = 0.0
+    last_alert_lower: float = 0.0
+
+
+@dataclass
+class MailConfig:
+    enabled: bool = False
+    smtp_server: str = "smtp.qq.com"
+    smtp_port: int = 587
+    sender_email: str = ""
+    sender_password: str = ""
+    receiver_email: str = ""
+    subject_prefix: str = "【金价预警】"
+
+
+@dataclass
+class AppConfig:
+    refresh_interval: int = DEFAULT_REFRESH_INTERVAL
+    alerts: Dict[str, AlertConfig] = None
+    mail: MailConfig = None
+
+    def __post_init__(self):
+        if self.alerts is None:
+            self.alerts = {
+                "zheshang": AlertConfig(),
+                "minsheng": AlertConfig()
+            }
+        if self.mail is None:
+            self.mail = MailConfig()
+
+# ------------------ 主类 ------------------
 
 
 class GoldPriceMonitor:
-    def __init__(self, interval=DEFAULT_REFRESH_INTERVAL):
-        self.interval = interval
+    def __init__(self):
+        self.config = self.load_config()
         self.is_active = True
-        self.lock = threading.Lock()
-
+        self.lock = threading.RLock()  # 可重入锁
         self.zsh_data = {"price": None, "change": None, "error": None}
         self.ms_data = {"price": None, "change": None, "error": None}
 
-        # 预警配置
-        self.alerts = {
-            "zheshang": {
-                "enabled": True,
-                "upper": None,
-                "lower": None,
-                "last_alert_upper": 0,
-                "last_alert_lower": 0
-            },
-            "minsheng": {
-                "enabled": True,
-                "upper": None,
-                "lower": None,
-                "last_alert_upper": 0,
-                "last_alert_lower": 0
-            }
-        }
-        self.load_alerts_config()
-
-        # 邮件配置
-        self.mail_config = {
-            "enabled": False,            # 是否启用邮件预警
-            "smtp_server": "smtp.qq.com",
-            "smtp_port": 587,
-            "sender_email": "",
-            "sender_password": "",       # 授权码
-            "receiver_email": "",
-            "subject_prefix": "【金价预警】"
-        }
-        self.load_mail_config()  # 新增方法
-
-        # 创建根窗口（隐藏，用于事件循环）
+        # 创建隐藏根窗口
         self.root = tk.Tk()
         self.root.withdraw()
+        self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
         # 创建悬浮窗
         self.create_floating_window()
@@ -88,255 +116,165 @@ class GoldPriceMonitor:
             target=self.fetch_loop, daemon=True)
         self.fetch_thread.start()
 
-        # 关闭窗口时退出程序
-        self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
+        # 启动邮件发送线程池（简单起见，直接使用 threading.Thread）
+        self.mail_threads = []
 
-    # ---------- 设置窗口界面初始化 ----------
-    def show_alert_settings(self):
-        win = tk.Toplevel(self.root)
-        win.title("设置")
-        win.geometry("550x450")
-        win.attributes('-topmost', True)
-        win.resizable(False, False)
-        win.grab_set()
+    # ---------- 配置加载与保存 ----------
+    def load_config(self) -> AppConfig:
+        """加载配置文件，若不存在则返回默认配置"""
+        if not os.path.exists(CONFIG_FILE):
+            return AppConfig()
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            cfg = AppConfig()
+            cfg.refresh_interval = data.get(
+                "refresh_interval", DEFAULT_REFRESH_INTERVAL)
+            # 加载预警配置
+            for bank in ["zheshang", "minsheng"]:
+                if bank in data.get("alerts", {}):
+                    alert_data = data["alerts"][bank]
+                    cfg.alerts[bank] = AlertConfig(
+                        enabled=alert_data.get("enabled", True),
+                        upper=alert_data.get("upper"),
+                        lower=alert_data.get("lower"),
+                        last_alert_upper=alert_data.get("last_alert_upper", 0),
+                        last_alert_lower=alert_data.get("last_alert_lower", 0)
+                    )
+            # 加载邮件配置
+            if "mail" in data:
+                mail_data = data["mail"]
+                cfg.mail = MailConfig(
+                    enabled=mail_data.get("enabled", False),
+                    smtp_server=mail_data.get("smtp_server", "smtp.qq.com"),
+                    smtp_port=mail_data.get("smtp_port", 587),
+                    sender_email=mail_data.get("sender_email", ""),
+                    sender_password=mail_data.get("sender_password", ""),
+                    receiver_email=mail_data.get("receiver_email", ""),
+                    subject_prefix=mail_data.get("subject_prefix", "【金价预警】")
+                )
+            logger.info("配置加载成功")
+            return cfg
+        except Exception as e:
+            logger.error(f"加载配置失败: {e}")
+            return AppConfig()
 
-        nb = ttk.Notebook(win)
-        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    def save_config(self):
+        """保存配置到文件"""
+        try:
+            data = {
+                "refresh_interval": self.config.refresh_interval,
+                "alerts": {
+                    bank: {
+                        "enabled": cfg.enabled,
+                        "upper": cfg.upper,
+                        "lower": cfg.lower,
+                        "last_alert_upper": cfg.last_alert_upper,
+                        "last_alert_lower": cfg.last_alert_lower
+                    } for bank, cfg in self.config.alerts.items()
+                },
+                "mail": asdict(self.config.mail)
+            }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.info("配置保存成功")
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
 
-        # 浙商选项卡
-        zsh_frame = ttk.Frame(nb)
-        nb.add(zsh_frame, text="浙商金价")
-        self._create_alert_ui(zsh_frame, "zheshang")
-        win.zsh_frame = zsh_frame
+    # ---------- 网络请求（带重试） ----------
+    def fetch_single(self, url: str, source_name: str, retries=2) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        """获取单个API数据，返回 (价格, 涨跌, 错误信息)"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        for attempt in range(retries + 1):
+            try:
+                response = requests.get(url, headers=headers, timeout=5)
+                response.raise_for_status()
+                data = response.json()
+                if DEBUG:
+                    logger.debug(
+                        f"{source_name} 原始响应: {json.dumps(data, indent=2, ensure_ascii=False)}")
 
-        # 民生选项卡
-        ms_frame = ttk.Frame(nb)
-        nb.add(ms_frame, text="民生金价")
-        self._create_alert_ui(ms_frame, "minsheng")
-        win.ms_frame = ms_frame
+                result = data.get('resultData', {})
+                datas = result.get('datas', {})
+                price_str = datas.get('price')
+                change_str = datas.get('upAndDownAmt')
+                if price_str is None or change_str is None:
+                    raise ValueError(f"{source_name} API 返回数据缺失必要字段")
+                return float(price_str), float(change_str), None
+            except Exception as e:
+                logger.warning(
+                    f"{source_name} 获取失败 (尝试 {attempt+1}/{retries+1}): {e}")
+                if attempt == retries:
+                    return None, None, str(e)
+                time.sleep(1)
+        return None, None, "未知错误"
 
-        # 邮件设置选项卡
-        mail_frame = ttk.Frame(nb)
-        nb.add(mail_frame, text="邮件通知")
-        self._create_mail_ui(mail_frame)
-        win.mail_frame = mail_frame
+    # ---------- 数据获取循环 ----------
+    def fetch_loop(self):
+        while True:
+            if not self.is_active:
+                time.sleep(self.config.refresh_interval)
+                continue
 
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(pady=10)
-        tk.Button(btn_frame, text="保存", command=lambda: self._save_all_settings(
-            win)).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="取消", command=win.destroy).pack(
-            side=tk.LEFT, padx=5)
+            # 浙商
+            price_z, change_z, err_z = self.fetch_single(ZSH_URL, "zheshang")
+            with self.lock:
+                self.zsh_data = {"price": price_z,
+                                 "change": change_z, "error": err_z}
+                current_price = price_z
+                current_err = err_z
+            if current_price is not None and not current_err:
+                self.check_and_alert("zheshang", current_price, time.time())
 
-    # ---------- 创建预警设置界面 ----------
-    def _create_alert_ui(self, parent, bank_key):
-        bank_name = "浙商" if bank_key == "zheshang" else "民生"
-        self.load_alerts_config()
-        cfg = self.alerts[bank_key]
+            # 民生
+            price_m, change_m, err_m = self.fetch_single(MS_URL, "minsheng")
+            with self.lock:
+                self.ms_data = {"price": price_m,
+                                "change": change_m, "error": err_m}
+                current_price = price_m
+                current_err = err_m
+            if current_price is not None and not current_err:
+                self.check_and_alert("minsheng", current_price, time.time())
 
-        enabled_var = tk.BooleanVar(value=cfg["enabled"])
-        tk.Checkbutton(parent, text=f"启用{bank_name}金价预警", variable=enabled_var).grid(
-            row=0, column=0, columnspan=2, sticky='w', pady=5)
-
-        tk.Label(parent, text="上限价格（高于此值预警）:").grid(
-            row=1, column=0, sticky='e', padx=5, pady=5)
-        upper_entry = tk.Entry(parent, width=15)
-        upper_entry.insert(0, str(cfg["upper"])
-                           if cfg["upper"] is not None else "")
-        upper_entry.grid(row=1, column=1, sticky='w', padx=5)
-
-        tk.Label(parent, text="下限价格（低于此值预警）:").grid(
-            row=2, column=0, sticky='e', padx=5, pady=5)
-        lower_entry = tk.Entry(parent, width=15)
-        lower_entry.insert(0, str(cfg["lower"])
-                           if cfg["lower"] is not None else "")
-        lower_entry.grid(row=2, column=1, sticky='w', padx=5)
-
-        parent.enabled_var = enabled_var
-        parent.upper_entry = upper_entry
-        parent.lower_entry = lower_entry
-
-    # ---------- 创建邮件设置界面 ----------
-    def _create_mail_ui(self, parent):
-        # 启用复选框
-        self.mail_enabled_var = tk.BooleanVar(
-            value=self.mail_config["enabled"])
-        tk.Checkbutton(parent, text="启用邮件预警", variable=self.mail_enabled_var).grid(
-            row=0, column=0, columnspan=2, sticky='w', pady=5)
-
-        # 服务器
-        tk.Label(parent, text="SMTP服务器:").grid(
-            row=1, column=0, sticky='e', padx=5, pady=5)
-        self.smtp_server_entry = tk.Entry(parent, width=30)
-        self.smtp_server_entry.insert(0, self.mail_config["smtp_server"])
-        self.smtp_server_entry.grid(row=1, column=1, sticky='w', padx=5)
-
-        # 端口
-        tk.Label(parent, text="端口:").grid(
-            row=2, column=0, sticky='e', padx=5, pady=5)
-        self.smtp_port_entry = tk.Entry(parent, width=10)
-        self.smtp_port_entry.insert(0, str(self.mail_config["smtp_port"]))
-        self.smtp_port_entry.grid(row=2, column=1, sticky='w', padx=5)
-
-        # 发件邮箱
-        tk.Label(parent, text="发件邮箱:").grid(
-            row=3, column=0, sticky='e', padx=5, pady=5)
-        self.sender_email_entry = tk.Entry(parent, width=30)
-        self.sender_email_entry.insert(0, self.mail_config["sender_email"])
-        self.sender_email_entry.grid(row=3, column=1, sticky='w', padx=5)
-
-        # 授权码/密码
-        tk.Label(parent, text="授权码:").grid(
-            row=4, column=0, sticky='e', padx=5, pady=5)
-        self.sender_pwd_entry = tk.Entry(parent, width=30, show="*")
-        self.sender_pwd_entry.insert(0, self.mail_config["sender_password"])
-        self.sender_pwd_entry.grid(row=4, column=1, sticky='w', padx=5)
-
-        # 收件邮箱
-        tk.Label(parent, text="收件邮箱:").grid(
-            row=5, column=0, sticky='e', padx=5, pady=5)
-        self.receiver_email_entry = tk.Entry(parent, width=30)
-        self.receiver_email_entry.insert(0, self.mail_config["receiver_email"])
-        self.receiver_email_entry.grid(row=5, column=1, sticky='w', padx=5)
-
-        # 主题前缀（可选）
-        tk.Label(parent, text="邮件主题前缀:").grid(
-            row=6, column=0, sticky='e', padx=5, pady=5)
-        self.subject_prefix_entry = tk.Entry(parent, width=30)
-        self.subject_prefix_entry.insert(0, self.mail_config["subject_prefix"])
-        self.subject_prefix_entry.grid(row=6, column=1, sticky='w', padx=5)
-
-    # ---------- 保存配置 ----------
-    def _save_all_settings(self, win):
-        # 保存预警配置
-        zsh_frame = win.zsh_frame
-        ms_frame = win.ms_frame
-
-        self.alerts["zheshang"]["enabled"] = zsh_frame.enabled_var.get()
-        upper_str = zsh_frame.upper_entry.get().strip()
-        lower_str = zsh_frame.lower_entry.get().strip()
-        self.alerts["zheshang"]["upper"] = float(
-            upper_str) if upper_str else None
-        self.alerts["zheshang"]["lower"] = float(
-            lower_str) if lower_str else None
-
-        self.alerts["minsheng"]["enabled"] = ms_frame.enabled_var.get()
-        upper_str = ms_frame.upper_entry.get().strip()
-        lower_str = ms_frame.lower_entry.get().strip()
-        self.alerts["minsheng"]["upper"] = float(
-            upper_str) if upper_str else None
-        self.alerts["minsheng"]["lower"] = float(
-            lower_str) if lower_str else None
-
-        # 保存邮件配置
-        self.mail_config["enabled"] = self.mail_enabled_var.get()
-        self.mail_config["smtp_server"] = self.smtp_server_entry.get().strip()
-        self.mail_config["smtp_port"] = int(self.smtp_port_entry.get().strip())
-        self.mail_config["sender_email"] = self.sender_email_entry.get().strip()
-        self.mail_config["sender_password"] = self.sender_pwd_entry.get(
-        ).strip()
-        self.mail_config["receiver_email"] = self.receiver_email_entry.get(
-        ).strip()
-        self.mail_config["subject_prefix"] = self.subject_prefix_entry.get(
-        ).strip()
-
-        # 保存到文件
-        self.save_alerts_config()   # 注意：需要修改此方法同时保存邮件配置
-        self.save_mail_config()     # 可合并为一个保存方法
-        win.destroy()
+            self.root.after(0, self.update_gui)
+            time.sleep(self.config.refresh_interval)
 
     # ---------- 预警检查 ----------
-    def check_and_alert(self, bank_key, price, current_time):
-        self.load_alerts_config()
-        cfg = self.alerts[bank_key]
-        if not cfg["enabled"]:
+    def check_and_alert(self, bank_key: str, price: float, current_time: float):
+        cfg = self.config.alerts[bank_key]
+        if not cfg.enabled:
             return
         bank_name = "浙商" if bank_key == "zheshang" else "民生"
 
         # 上限
-        if cfg["upper"] is not None and price > cfg["upper"]:
-            if current_time - cfg["last_alert_upper"] > ALERT_COOLDOWN_SECONDS:
-                cfg["last_alert_upper"] = current_time
-                self.show_alert_dialog(bank_name, price, "高于上限", cfg["upper"])
-                self.save_alerts_config()
+        if cfg.upper is not None and price > cfg.upper:
+            if current_time - cfg.last_alert_upper > ALERT_COOLDOWN_SECONDS:
+                cfg.last_alert_upper = current_time
+                self.save_config()
+                self.show_alert_dialog(bank_name, price, "高于上限", cfg.upper)
 
         # 下限
-        if cfg["lower"] is not None and price < cfg["lower"]:
-            if current_time - cfg["last_alert_lower"] > ALERT_COOLDOWN_SECONDS:
-                cfg["last_alert_lower"] = current_time
-                self.show_alert_dialog(bank_name, price, "低于下限", cfg["lower"])
-                self.save_alerts_config()
+        if cfg.lower is not None and price < cfg.lower:
+            if current_time - cfg.last_alert_lower > ALERT_COOLDOWN_SECONDS:
+                cfg.last_alert_lower = current_time
+                self.save_config()
+                self.show_alert_dialog(bank_name, price, "低于下限", cfg.lower)
 
-    # ---------- 预警弹窗提醒 ----------
-    def show_alert_dialog(self, bank_name, price, alert_type, threshold):
+    def show_alert_dialog(self, bank_name: str, price: float, alert_type: str, threshold: float):
         msg = f"{bank_name} 金价 {price:.2f} 元/克\n{alert_type} {threshold:.2f} 元/克"
         self.root.after(0, lambda: messagebox.showwarning("金价预警", msg))
-        # 发送邮件（在子线程中，避免阻塞）
-        threading.Thread(target=self.send_mail_alert, args=(bank_name, price, alert_type, threshold), daemon=True).start()
+        # 异步发送邮件
+        threading.Thread(target=self.send_mail_alert, args=(
+            bank_name, price, alert_type, threshold), daemon=True).start()
 
-    # ---------- 加载预警配置 ----------
-    def load_alerts_config(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                    for bank in ['zheshang', 'minsheng']:
-                        if bank in saved:
-                            self.alerts[bank].update(saved[bank])
-            except Exception as e:
-                print(f"加载预警配置失败: {e}")
-
-    # ---------- 保存预警配置 ----------
-    def save_alerts_config(self):
-        try:
-            to_save = {}
-            for bank in ['zheshang', 'minsheng']:
-                to_save[bank] = {
-                    "enabled": self.alerts[bank]["enabled"],
-                    "upper": self.alerts[bank]["upper"],
-                    "lower": self.alerts[bank]["lower"]
-                }
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(to_save, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"保存预警配置失败: {e}")
-
-    # ---------- 加载邮件配置 ----------
-    def load_mail_config(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                    if "mail_config" in saved:
-                        self.mail_config.update(saved["mail_config"])
-            except Exception as e:
-                print(f"加载邮件配置失败: {e}")
-
-    # ---------- 保存邮件配置（在保存预警设置时一并保存） ----------
-    def save_mail_config(self):
-        try:
-            # 读取现有文件，更新 mail_config
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            else:
-                data = {}
-            data["mail_config"] = self.mail_config.copy()
-            # 注意：不要保存密码明文？如需更安全可加密，此处简化
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"保存邮件配置失败: {e}")
-
-    # ---------- 发送邮件预警（在子线程中运行） ----------
-    def send_mail_alert(self, bank_name, price, alert_type, threshold):
-        if not self.mail_config["enabled"]:
+    # ---------- 邮件发送（带重试） ----------
+    def send_mail_alert(self, bank_name: str, price: float, alert_type: str, threshold: float):
+        """发送邮件预警，失败时记录日志"""
+        if not self.config.mail.enabled:
             return
         try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.header import Header
-
             msg = MIMEText(f"""
                 金价预警
 
@@ -344,26 +282,26 @@ class GoldPriceMonitor:
                 当前价格：{price:.2f} 元/克
                 触发类型：{alert_type}
                 阈值：{threshold:.2f} 元/克
-                时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
+                时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             """, "plain", "utf-8")
             msg['Subject'] = Header(
-                f"{self.mail_config['subject_prefix']}{bank_name}金价{alert_type}", "utf-8")
-            msg['From'] = self.mail_config["sender_email"]
-            msg['To'] = self.mail_config["receiver_email"]
+                f"{self.config.mail.subject_prefix}{bank_name}金价{alert_type}", "utf-8")
+            msg['From'] = self.config.mail.sender_email
+            msg['To'] = self.config.mail.receiver_email
 
             server = smtplib.SMTP(
-                self.mail_config["smtp_server"], self.mail_config["smtp_port"])
+                self.config.mail.smtp_server, self.config.mail.smtp_port)
             server.starttls()
-            server.login(self.mail_config["sender_email"],
-                        self.mail_config["sender_password"])
-            server.sendmail(self.mail_config["sender_email"], [
-                            self.mail_config["receiver_email"]], msg.as_string())
+            server.login(self.config.mail.sender_email,
+                         self.config.mail.sender_password)
+            server.sendmail(self.config.mail.sender_email, [
+                            self.config.mail.receiver_email], msg.as_string())
             server.quit()
-            print(f"邮件预警已发送至 {self.mail_config['receiver_email']}")
+            logger.info(f"邮件预警已发送至 {self.config.mail.receiver_email}")
         except Exception as e:
-            print(f"发送邮件失败: {e}")
+            logger.error(f"发送邮件失败: {e}")
 
-    # ---------- 悬浮窗（主窗口） ----------
+    # ---------- 悬浮窗 ----------
     def create_floating_window(self):
         self.floating = tk.Toplevel(self.root)
         self.floating.title("金价监控")
@@ -377,28 +315,20 @@ class GoldPriceMonitor:
         self.frame = tk.Frame(self.floating, bg='#2c3e50')
         self.frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.zsh_label = tk.Label(
-            self.frame, text="浙商: 等待数据", font=("微软雅黑", 12),
-            fg='#ecf0f1', bg='#2c3e50'
-        )
+        self.zsh_label = tk.Label(self.frame, text="浙商: 等待数据", font=(
+            "微软雅黑", 12), fg='#ecf0f1', bg='#2c3e50')
         self.zsh_label.pack(anchor='w', pady=2)
 
-        self.ms_label = tk.Label(
-            self.frame, text="民生: 等待数据", font=("微软雅黑", 12),
-            fg='#ecf0f1', bg='#2c3e50'
-        )
+        self.ms_label = tk.Label(self.frame, text="民生: 等待数据", font=(
+            "微软雅黑", 12), fg='#ecf0f1', bg='#2c3e50')
         self.ms_label.pack(anchor='w', pady=2)
 
-        self.change_label = tk.Label(
-            self.frame, text="", font=("微软雅黑", 10),
-            fg='#bdc3c7', bg='#2c3e50'
-        )
+        self.change_label = tk.Label(self.frame, text="", font=(
+            "微软雅黑", 10), fg='#bdc3c7', bg='#2c3e50')
         self.change_label.pack(anchor='w', pady=2)
 
-        self.status_label = tk.Label(
-            self.frame, text="● 运行中", font=("微软雅黑", 9),
-            fg='#2ecc71', bg='#2c3e50'
-        )
+        self.status_label = tk.Label(self.frame, text="● 运行中", font=(
+            "微软雅黑", 9), fg='#2ecc71', bg='#2c3e50')
         self.status_label.pack(anchor='w', pady=2)
 
         # 拖动
@@ -415,8 +345,7 @@ class GoldPriceMonitor:
         self.context_menu.add_command(
             label="继续刷新", command=self.resume_monitor)
         self.context_menu.add_separator()
-        self.context_menu.add_command(
-            label="设置", command=self.show_alert_settings)
+        self.context_menu.add_command(label="设置", command=self.show_settings)
         self.context_menu.add_command(label="退出", command=self.quit_app)
 
     def start_move(self, event):
@@ -438,122 +367,160 @@ class GoldPriceMonitor:
         self.floating.deiconify()
         self.floating.lift()
 
-    # ---------- 系统托盘 ----------
-    def create_tray_icon(self):
-        size = 64
-        image = Image.new('RGB', (size, size), color=(255, 215, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle([size//4, size//4, size*3//4,
-                       size*3//4], fill=(255, 140, 0))
-        draw.ellipse([size//3, size//3, size*2//3,
-                     size*2//3], fill=(255, 215, 0))
+    # ---------- 设置窗口 ----------
+    def show_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("设置")
+        win.geometry("550x450")
+        win.attributes('-topmost', True)
+        win.resizable(False, False)
+        win.grab_set()
 
-        menu = pystray.Menu(
-            pystray.MenuItem("显示窗口", self.show_window, default=True),
-            pystray.MenuItem("隐藏窗口", self.hide_window),
-            pystray.MenuItem("停止刷新", self.tray_stop_monitor,
-                             enabled=lambda item: self.is_active),
-            pystray.MenuItem("继续刷新", self.tray_resume_monitor,
-                             enabled=lambda item: not self.is_active),
-            pystray.MenuItem("设置", self.show_alert_settings),
-            pystray.MenuItem("退出", self.quit_app)
-        )
-        return pystray.Icon("gold_monitor", image, "金价监控", menu)
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    def setup_tray(self):
-        if not PYSTRAY_AVAILABLE:
-            return
-        self.tray_icon = self.create_tray_icon()
-        threading.Thread(target=self.tray_icon.run_detached,
-                         daemon=True).start()
-        self.root.after(100, self.update_tray_tooltip)
+        # 浙商选项卡
+        zsh_frame = ttk.Frame(nb)
+        nb.add(zsh_frame, text="浙商金价")
+        self._create_alert_ui(zsh_frame, "zheshang")
 
-    def update_tray_tooltip(self):
-        if not PYSTRAY_AVAILABLE or not hasattr(self, 'tray_icon') or self.tray_icon is None:
-            return
-        with self.lock:
-            zsh = self.zsh_data
-            ms = self.ms_data
+        # 民生选项卡
+        ms_frame = ttk.Frame(nb)
+        nb.add(ms_frame, text="民生金价")
+        self._create_alert_ui(ms_frame, "minsheng")
 
-        lines = []
-        if zsh["error"]:
-            lines.append(f"浙商: 错误 - {zsh['error']}")
-        elif zsh["price"] is not None:
-            change = zsh["change"]
-            sign = "+" if change >= 0 else ""
-            lines.append(f"浙商: {zsh['price']:.2f} 元/克 ({sign}{change:.2f})")
-        else:
-            lines.append("浙商: 等待数据")
+        # 邮件设置选项卡
+        mail_frame = ttk.Frame(nb)
+        nb.add(mail_frame, text="邮件通知")
+        self._create_mail_ui(mail_frame)
 
-        if ms["error"]:
-            lines.append(f"民生: 错误 - {ms['error']}")
-        elif ms["price"] is not None:
-            change = ms["change"]
-            sign = "+" if change >= 0 else ""
-            lines.append(f"民生: {ms['price']:.2f} 元/克 ({sign}{change:.2f})")
-        else:
-            lines.append("民生: 等待数据")
+        # 通用设置选项卡（刷新间隔）
+        general_frame = ttk.Frame(nb)
+        nb.add(general_frame, text="通用")
+        self._create_general_ui(general_frame)
 
-        tooltip = "\n".join(lines)
-        self.tray_icon.title = tooltip
-        self.root.after(1000, self.update_tray_tooltip)
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="保存", command=lambda: self._save_all_settings(
+            win)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="取消", command=win.destroy).pack(
+            side=tk.LEFT, padx=5)
 
-    def tray_stop_monitor(self, item=None):
-        self.stop_monitor()
+    def _create_alert_ui(self, parent, bank_key):
+        cfg = self.config.alerts[bank_key]
+        bank_name = "浙商" if bank_key == "zheshang" else "民生"
 
-    def tray_resume_monitor(self, item=None):
-        self.resume_monitor()
+        enabled_var = tk.BooleanVar(value=cfg.enabled)
+        tk.Checkbutton(parent, text=f"启用{bank_name}金价预警", variable=enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=5)
 
-    # ---------- 数据获取与更新 ----------
-    def fetch_single(self, url, source_name):
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
+        tk.Label(parent, text="上限价格（高于此值预警）:").grid(
+            row=1, column=0, sticky='e', padx=5, pady=5)
+        upper_entry = tk.Entry(parent, width=15)
+        upper_entry.insert(0, str(cfg.upper) if cfg.upper is not None else "")
+        upper_entry.grid(row=1, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="下限价格（低于此值预警）:").grid(
+            row=2, column=0, sticky='e', padx=5, pady=5)
+        lower_entry = tk.Entry(parent, width=15)
+        lower_entry.insert(0, str(cfg.lower) if cfg.lower is not None else "")
+        lower_entry.grid(row=2, column=1, sticky='w', padx=5)
+
+        parent.enabled_var = enabled_var
+        parent.upper_entry = upper_entry
+        parent.lower_entry = lower_entry
+
+    def _create_mail_ui(self, parent):
+        mail_cfg = self.config.mail
+        self.mail_enabled_var = tk.BooleanVar(value=mail_cfg.enabled)
+        tk.Checkbutton(parent, text="启用邮件预警", variable=self.mail_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=5)
+
+        tk.Label(parent, text="SMTP服务器:").grid(
+            row=1, column=0, sticky='e', padx=5, pady=5)
+        self.smtp_server_entry = tk.Entry(parent, width=30)
+        self.smtp_server_entry.insert(0, mail_cfg.smtp_server)
+        self.smtp_server_entry.grid(row=1, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="端口:").grid(
+            row=2, column=0, sticky='e', padx=5, pady=5)
+        self.smtp_port_entry = tk.Entry(parent, width=10)
+        self.smtp_port_entry.insert(0, str(mail_cfg.smtp_port))
+        self.smtp_port_entry.grid(row=2, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="发件邮箱:").grid(
+            row=3, column=0, sticky='e', padx=5, pady=5)
+        self.sender_email_entry = tk.Entry(parent, width=30)
+        self.sender_email_entry.insert(0, mail_cfg.sender_email)
+        self.sender_email_entry.grid(row=3, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="授权码:").grid(
+            row=4, column=0, sticky='e', padx=5, pady=5)
+        self.sender_pwd_entry = tk.Entry(parent, width=30, show="*")
+        self.sender_pwd_entry.insert(0, mail_cfg.sender_password)
+        self.sender_pwd_entry.grid(row=4, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="收件邮箱:").grid(
+            row=5, column=0, sticky='e', padx=5, pady=5)
+        self.receiver_email_entry = tk.Entry(parent, width=30)
+        self.receiver_email_entry.insert(0, mail_cfg.receiver_email)
+        self.receiver_email_entry.grid(row=5, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="邮件主题前缀:").grid(
+            row=6, column=0, sticky='e', padx=5, pady=5)
+        self.subject_prefix_entry = tk.Entry(parent, width=30)
+        self.subject_prefix_entry.insert(0, mail_cfg.subject_prefix)
+        self.subject_prefix_entry.grid(row=6, column=1, sticky='w', padx=5)
+
+    def _create_general_ui(self, parent):
+        tk.Label(parent, text="刷新间隔 (秒):").grid(
+            row=0, column=0, sticky='e', padx=5, pady=5)
+        self.refresh_interval_entry = tk.Entry(parent, width=10)
+        self.refresh_interval_entry.insert(
+            0, str(self.config.refresh_interval))
+        self.refresh_interval_entry.grid(row=0, column=1, sticky='w', padx=5)
+
+    def _save_all_settings(self, win):
+        # 保存预警
+        for tab_name, bank_key in [("zheshang", "zheshang"), ("minsheng", "minsheng")]:
+            # 通过遍历 win 的子部件获取对应 frame（简便方法：利用标签页的 children）
+            frame = None
+            for child in win.winfo_children():
+                if isinstance(child, ttk.Notebook):
+                    for tab_id in range(child.index("end")):
+                        tab = child.nametowidget(child.tabs()[tab_id])
+                        if child.tab(tab_id, "text") == ("浙商金价" if bank_key == "zheshang" else "民生金价"):
+                            frame = tab
+                            break
+            if frame:
+                cfg = self.config.alerts[bank_key]
+                cfg.enabled = frame.enabled_var.get()
+                upper_str = frame.upper_entry.get().strip()
+                cfg.upper = float(upper_str) if upper_str else None
+                lower_str = frame.lower_entry.get().strip()
+                cfg.lower = float(lower_str) if lower_str else None
+
+        # 保存邮件
+        self.config.mail.enabled = self.mail_enabled_var.get()
+        self.config.mail.smtp_server = self.smtp_server_entry.get().strip()
+        self.config.mail.smtp_port = int(self.smtp_port_entry.get().strip())
+        self.config.mail.sender_email = self.sender_email_entry.get().strip()
+        self.config.mail.sender_password = self.sender_pwd_entry.get().strip()
+        self.config.mail.receiver_email = self.receiver_email_entry.get().strip()
+        self.config.mail.subject_prefix = self.subject_prefix_entry.get().strip()
+
+        # 保存刷新间隔
+        interval_str = self.refresh_interval_entry.get().strip()
         try:
-            response = requests.get(url, headers=headers, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            if DEBUG:
-                print(f"=== {source_name} 原始响应 ===")
-                print(json.dumps(data, indent=2, ensure_ascii=False))
+            self.config.refresh_interval = max(1, int(interval_str))
+        except ValueError:
+            self.config.refresh_interval = DEFAULT_REFRESH_INTERVAL
 
-            result = data.get('resultData', {})
-            datas = result.get('datas', {})
-            price_str = datas.get('price')
-            change_str = datas.get('upAndDownAmt')
-            if price_str is None or change_str is None:
-                raise ValueError(f"{source_name} API 返回数据缺失必要字段")
-            return float(price_str), float(change_str), None
-        except Exception as e:
-            return None, None, str(e)
+        self.save_config()
+        win.destroy()
+        logger.info("设置已保存")
 
-    def fetch_loop(self):
-        while True:
-            if not self.is_active:
-                time.sleep(self.interval)
-                continue
-
-            price_z, change_z, err_z = self.fetch_single(ZSH_URL, "zheshang")
-            with self.lock:
-                self.zsh_data = {"price": price_z,
-                                 "change": change_z, "error": err_z}
-
-            price_m, change_m, err_m = self.fetch_single(MS_URL, "minsheng")
-            with self.lock:
-                self.ms_data = {"price": price_m,
-                                "change": change_m, "error": err_m}
-
-            self.root.after(0, self.update_gui)
-
-            # 预警检查
-            current_time = time.time()
-            if price_z is not None and not err_z:
-                self.check_and_alert("zheshang", price_z, current_time)
-            if price_m is not None and not err_m:
-                self.check_and_alert("minsheng", price_m, current_time)
-
-            time.sleep(self.interval)
-
+    # ---------- 更新 GUI ----------
     def update_gui(self):
         with self.lock:
             zsh = self.zsh_data
@@ -595,15 +562,87 @@ class GoldPriceMonitor:
         else:
             self.status_label.config(text="● 已暂停", fg='#e67e22')
 
+    # ---------- 控制方法 ----------
     def stop_monitor(self):
         self.is_active = False
         self.root.after(0, self.update_gui)
+        logger.info("监控已暂停")
 
     def resume_monitor(self):
         self.is_active = True
         self.root.after(0, self.update_gui)
+        logger.info("监控已恢复")
 
+    # ---------- 系统托盘 ----------
+    def setup_tray(self):
+        if not PYSTRAY_AVAILABLE:
+            logger.warning("pystray 未安装，系统托盘功能不可用")
+            return
+        self.tray_icon = self.create_tray_icon()
+        threading.Thread(target=self.tray_icon.run_detached,
+                         daemon=True).start()
+        self.root.after(100, self.update_tray_tooltip)
+
+    def create_tray_icon(self):
+        size = 64
+        image = Image.new('RGB', (size, size), color=(255, 215, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle([size//4, size//4, size*3//4,
+                       size*3//4], fill=(255, 140, 0))
+        draw.ellipse([size//3, size//3, size*2//3,
+                     size*2//3], fill=(255, 215, 0))
+
+        menu = pystray.Menu(
+            pystray.MenuItem("显示窗口", self.show_window, default=True),
+            pystray.MenuItem("隐藏窗口", self.hide_window),
+            pystray.MenuItem("停止刷新", self.tray_stop_monitor,
+                             enabled=lambda item: self.is_active),
+            pystray.MenuItem("继续刷新", self.tray_resume_monitor,
+                             enabled=lambda item: not self.is_active),
+            pystray.MenuItem("设置", self.show_settings),
+            pystray.MenuItem("退出", self.quit_app)
+        )
+        return pystray.Icon("gold_monitor", image, "金价监控", menu)
+
+    def update_tray_tooltip(self):
+        if not PYSTRAY_AVAILABLE or not hasattr(self, 'tray_icon') or self.tray_icon is None:
+            return
+        with self.lock:
+            zsh = self.zsh_data
+            ms = self.ms_data
+
+        lines = []
+        if zsh["error"]:
+            lines.append(f"浙商: 错误 - {zsh['error']}")
+        elif zsh["price"] is not None:
+            change = zsh["change"]
+            sign = "+" if change >= 0 else ""
+            lines.append(f"浙商: {zsh['price']:.2f} 元/克 ({sign}{change:.2f})")
+        else:
+            lines.append("浙商: 等待数据")
+
+        if ms["error"]:
+            lines.append(f"民生: 错误 - {ms['error']}")
+        elif ms["price"] is not None:
+            change = ms["change"]
+            sign = "+" if change >= 0 else ""
+            lines.append(f"民生: {ms['price']:.2f} 元/克 ({sign}{change:.2f})")
+        else:
+            lines.append("民生: 等待数据")
+
+        tooltip = "\n".join(lines)
+        self.tray_icon.title = tooltip
+        self.root.after(1000, self.update_tray_tooltip)
+
+    def tray_stop_monitor(self, item=None):
+        self.stop_monitor()
+
+    def tray_resume_monitor(self, item=None):
+        self.resume_monitor()
+
+    # ---------- 退出 ----------
     def quit_app(self, item=None):
+        logger.info("程序退出")
         if PYSTRAY_AVAILABLE and hasattr(self, 'tray_icon') and self.tray_icon is not None:
             self.tray_icon.stop()
         self.root.quit()
