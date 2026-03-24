@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-金价实时监控--优化+日志
-version: 5.0
-功能：
-- 日志记录
-- 配置统一管理
-- 线程安全增强
-- 异常重试机制
+金价实时监控（悬浮窗版 + 价格预警）+ 邮件预警
+version: 6.0
+功能: 
+- 密码加密存储
 """
 
 import requests
@@ -19,6 +16,7 @@ import sys
 import os
 import logging
 import smtplib
+import base64
 from email.mime.text import MIMEText
 from email.header import Header
 from typing import Optional, Dict, Any, Tuple
@@ -47,9 +45,38 @@ logger = logging.getLogger("GoldMonitor")
 ZSH_URL = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816"
 MS_URL = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice"
 DEFAULT_REFRESH_INTERVAL = 1
-ALERT_COOLDOWN_SECONDS = 8
+ALERT_COOLDOWN_SECONDS = 20
 CONFIG_FILE = "gold_config.json"
 DEBUG = False
+
+# ------------------ 加密工具 ------------------
+# 固定密钥（可自行修改，注意保密性）
+_ENCRYPT_KEY = b'gold_monitor_2026_key!@#'
+
+
+def _simple_encrypt(text: str) -> str:
+    """简单异或加密 + Base64编码，返回加密后的字符串"""
+    if not text:
+        return ""
+    data = text.encode('utf-8')
+    key = _ENCRYPT_KEY
+    encrypted = bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
+    return base64.b64encode(encrypted).decode('ascii')
+
+
+def _simple_decrypt(encrypted: str) -> str:
+    """解密由_simple_encrypt加密的字符串"""
+    if not encrypted:
+        return ""
+    try:
+        data = base64.b64decode(encrypted.encode('ascii'))
+        key = _ENCRYPT_KEY
+        decrypted = bytes([data[i] ^ key[i % len(key)]
+                          for i in range(len(data))])
+        return decrypted.decode('utf-8')
+    except Exception as e:
+        logger.error(f"解密失败: {e}")
+        return ""
 
 # ------------------ 数据类 ------------------
 
@@ -69,7 +96,7 @@ class MailConfig:
     smtp_server: str = "smtp.qq.com"
     smtp_port: int = 587
     sender_email: str = ""
-    sender_password: str = ""
+    sender_password: str = ""   # 存储时加密
     receiver_email: str = ""
     subject_prefix: str = "【金价预警】"
 
@@ -96,32 +123,23 @@ class GoldPriceMonitor:
     def __init__(self):
         self.config = self.load_config()
         self.is_active = True
-        self.lock = threading.RLock()  # 可重入锁
+        self.lock = threading.RLock()
         self.zsh_data = {"price": None, "change": None, "error": None}
         self.ms_data = {"price": None, "change": None, "error": None}
 
-        # 创建隐藏根窗口
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
-        # 创建悬浮窗
         self.create_floating_window()
-
-        # 创建系统托盘
         self.setup_tray()
 
-        # 启动数据获取线程
         self.fetch_thread = threading.Thread(
             target=self.fetch_loop, daemon=True)
         self.fetch_thread.start()
 
-        # 启动邮件发送线程池（简单起见，直接使用 threading.Thread）
-        self.mail_threads = []
-
-    # ---------- 配置加载与保存 ----------
+    # ---------- 配置加载与保存（含密码加密） ----------
     def load_config(self) -> AppConfig:
-        """加载配置文件，若不存在则返回默认配置"""
         if not os.path.exists(CONFIG_FILE):
             return AppConfig()
         try:
@@ -130,6 +148,7 @@ class GoldPriceMonitor:
             cfg = AppConfig()
             cfg.refresh_interval = data.get(
                 "refresh_interval", DEFAULT_REFRESH_INTERVAL)
+
             # 加载预警配置
             for bank in ["zheshang", "minsheng"]:
                 if bank in data.get("alerts", {}):
@@ -141,15 +160,20 @@ class GoldPriceMonitor:
                         last_alert_upper=alert_data.get("last_alert_upper", 0),
                         last_alert_lower=alert_data.get("last_alert_lower", 0)
                     )
-            # 加载邮件配置
+
+            # 加载邮件配置（密码自动解密）
             if "mail" in data:
                 mail_data = data["mail"]
+                pwd = mail_data.get("sender_password", "")
+                # 兼容旧配置: 若以 'ENC:' 开头则解密，否则视为明文
+                if pwd.startswith("ENC:"):
+                    pwd = _simple_decrypt(pwd[4:])
                 cfg.mail = MailConfig(
                     enabled=mail_data.get("enabled", False),
                     smtp_server=mail_data.get("smtp_server", "smtp.qq.com"),
                     smtp_port=mail_data.get("smtp_port", 587),
                     sender_email=mail_data.get("sender_email", ""),
-                    sender_password=mail_data.get("sender_password", ""),
+                    sender_password=pwd,
                     receiver_email=mail_data.get("receiver_email", ""),
                     subject_prefix=mail_data.get("subject_prefix", "【金价预警】")
                 )
@@ -159,9 +183,15 @@ class GoldPriceMonitor:
             logger.error(f"加载配置失败: {e}")
             return AppConfig()
 
-    def save_config(self):
+    def save_config(self, log_success=True):
         """保存配置到文件"""
         try:
+            # 加密密码
+            encrypted_pwd = ""
+            if self.config.mail.sender_password:
+                encrypted_pwd = "ENC:" + \
+                    _simple_encrypt(self.config.mail.sender_password)
+
             data = {
                 "refresh_interval": self.config.refresh_interval,
                 "alerts": {
@@ -173,17 +203,25 @@ class GoldPriceMonitor:
                         "last_alert_lower": cfg.last_alert_lower
                     } for bank, cfg in self.config.alerts.items()
                 },
-                "mail": asdict(self.config.mail)
+                "mail": {
+                    "enabled": self.config.mail.enabled,
+                    "smtp_server": self.config.mail.smtp_server,
+                    "smtp_port": self.config.mail.smtp_port,
+                    "sender_email": self.config.mail.sender_email,
+                    "sender_password": encrypted_pwd,
+                    "receiver_email": self.config.mail.receiver_email,
+                    "subject_prefix": self.config.mail.subject_prefix
+                }
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info("配置保存成功")
+            if log_success:
+                logger.info("配置保存成功（密码已加密）")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
 
     # ---------- 网络请求（带重试） ----------
     def fetch_single(self, url: str, source_name: str, retries=2) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-        """获取单个API数据，返回 (价格, 涨跌, 错误信息)"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -218,7 +256,6 @@ class GoldPriceMonitor:
                 time.sleep(self.config.refresh_interval)
                 continue
 
-            # 浙商
             price_z, change_z, err_z = self.fetch_single(ZSH_URL, "zheshang")
             with self.lock:
                 self.zsh_data = {"price": price_z,
@@ -228,7 +265,6 @@ class GoldPriceMonitor:
             if current_price is not None and not current_err:
                 self.check_and_alert("zheshang", current_price, time.time())
 
-            # 民生
             price_m, change_m, err_m = self.fetch_single(MS_URL, "minsheng")
             with self.lock:
                 self.ms_data = {"price": price_m,
@@ -248,41 +284,41 @@ class GoldPriceMonitor:
             return
         bank_name = "浙商" if bank_key == "zheshang" else "民生"
 
-        # 上限
         if cfg.upper is not None and price > cfg.upper:
             if current_time - cfg.last_alert_upper > ALERT_COOLDOWN_SECONDS:
                 cfg.last_alert_upper = current_time
-                self.save_config()
-                self.show_alert_dialog(bank_name, price, "高于上限", cfg.upper)
+                self.save_config(log_success=False)
+                logger.info(bank_name + "当前价格: " +
+                            f"{price:.2f}" + " 元/克 高于上限: " + "{:.2f}".format(cfg.upper)+"元/克")
+                self.show_alert_dialog(bank_name, price, "高于上限: ", cfg.upper)
 
-        # 下限
         if cfg.lower is not None and price < cfg.lower:
             if current_time - cfg.last_alert_lower > ALERT_COOLDOWN_SECONDS:
                 cfg.last_alert_lower = current_time
-                self.save_config()
-                self.show_alert_dialog(bank_name, price, "低于下限", cfg.lower)
+                self.save_config(log_success=False)
+                logger.info(bank_name + "当前价格: " +
+                            f"{price:.2f}" + " 元/克 低于下限；" + "{:.2f}".format(cfg.upper)+"元/克")
+                self.show_alert_dialog(bank_name, price, "低于下限: ", cfg.lower)
 
     def show_alert_dialog(self, bank_name: str, price: float, alert_type: str, threshold: float):
-        msg = f"{bank_name} 金价 {price:.2f} 元/克\n{alert_type} {threshold:.2f} 元/克"
+        msg = f"{bank_name}金价: {price:.2f} 元/克\n{alert_type} {threshold:.2f} 元/克"
         self.root.after(0, lambda: messagebox.showwarning("金价预警", msg))
-        # 异步发送邮件
         threading.Thread(target=self.send_mail_alert, args=(
             bank_name, price, alert_type, threshold), daemon=True).start()
 
-    # ---------- 邮件发送（带重试） ----------
+    # ---------- 邮件发送 ----------
     def send_mail_alert(self, bank_name: str, price: float, alert_type: str, threshold: float):
-        """发送邮件预警，失败时记录日志"""
         if not self.config.mail.enabled:
             return
         try:
             msg = MIMEText(f"""
                 金价预警
 
-                银行：{bank_name}
-                当前价格：{price:.2f} 元/克
-                触发类型：{alert_type}
-                阈值：{threshold:.2f} 元/克
-                时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                银行: {bank_name}
+                当前价格: {price:.2f} 元/克
+                触发类型: {alert_type}
+                阈值: {threshold:.2f} 元/克
+                时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             """, "plain", "utf-8")
             msg['Subject'] = Header(
                 f"{self.config.mail.subject_prefix}{bank_name}金价{alert_type}", "utf-8")
@@ -331,12 +367,9 @@ class GoldPriceMonitor:
             "微软雅黑", 9), fg='#2ecc71', bg='#2c3e50')
         self.status_label.pack(anchor='w', pady=2)
 
-        # 拖动
         self.floating.bind('<Any-Button-1>', self.start_move)
         self.floating.bind('<Any-B1-Motion>', self.on_move)
         self.floating.config(cursor='fleur')
-
-        # 右键菜单
         self.floating.bind('<Button-3>', self.show_context_menu)
         self.context_menu = tk.Menu(self.floating, tearoff=0)
         self.context_menu.add_command(label="隐藏窗口", command=self.hide_window)
@@ -379,22 +412,18 @@ class GoldPriceMonitor:
         nb = ttk.Notebook(win)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # 浙商选项卡
         zsh_frame = ttk.Frame(nb)
         nb.add(zsh_frame, text="浙商金价")
         self._create_alert_ui(zsh_frame, "zheshang")
 
-        # 民生选项卡
         ms_frame = ttk.Frame(nb)
         nb.add(ms_frame, text="民生金价")
         self._create_alert_ui(ms_frame, "minsheng")
 
-        # 邮件设置选项卡
         mail_frame = ttk.Frame(nb)
         nb.add(mail_frame, text="邮件通知")
         self._create_mail_ui(mail_frame)
 
-        # 通用设置选项卡（刷新间隔）
         general_frame = ttk.Frame(nb)
         nb.add(general_frame, text="通用")
         self._create_general_ui(general_frame)
@@ -483,7 +512,6 @@ class GoldPriceMonitor:
     def _save_all_settings(self, win):
         # 保存预警
         for tab_name, bank_key in [("zheshang", "zheshang"), ("minsheng", "minsheng")]:
-            # 通过遍历 win 的子部件获取对应 frame（简便方法：利用标签页的 children）
             frame = None
             for child in win.winfo_children():
                 if isinstance(child, ttk.Notebook):
@@ -505,7 +533,7 @@ class GoldPriceMonitor:
         self.config.mail.smtp_server = self.smtp_server_entry.get().strip()
         self.config.mail.smtp_port = int(self.smtp_port_entry.get().strip())
         self.config.mail.sender_email = self.sender_email_entry.get().strip()
-        self.config.mail.sender_password = self.sender_pwd_entry.get().strip()
+        self.config.mail.sender_password = self.sender_pwd_entry.get().strip()  # 明文，保存时会加密
         self.config.mail.receiver_email = self.receiver_email_entry.get().strip()
         self.config.mail.subject_prefix = self.subject_prefix_entry.get().strip()
 
@@ -519,14 +547,12 @@ class GoldPriceMonitor:
         self.save_config()
         win.destroy()
         logger.info("设置已保存")
-
     # ---------- 更新 GUI ----------
     def update_gui(self):
         with self.lock:
             zsh = self.zsh_data
             ms = self.ms_data
 
-        # 浙商
         if zsh["error"]:
             zsh_text = f"浙商: 错误"
         elif zsh["price"] is not None:
@@ -534,7 +560,6 @@ class GoldPriceMonitor:
         else:
             zsh_text = "浙商: 等待数据"
 
-        # 民生
         if ms["error"]:
             ms_text = f"民生: 错误"
         elif ms["price"] is not None:
@@ -542,7 +567,6 @@ class GoldPriceMonitor:
         else:
             ms_text = "民生: 等待数据"
 
-        # 涨跌幅
         change_text = ""
         if zsh["price"] is not None and not zsh["error"]:
             change_z = zsh["change"]
