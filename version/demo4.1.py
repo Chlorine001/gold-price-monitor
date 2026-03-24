@@ -91,37 +91,11 @@ class GoldPriceMonitor:
         # 关闭窗口时退出程序
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
-    # ---------- 预警配置持久化 ----------
-    def load_alerts_config(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved = json.load(f)
-                    for bank in ['zheshang', 'minsheng']:
-                        if bank in saved:
-                            self.alerts[bank].update(saved[bank])
-            except Exception as e:
-                print(f"加载预警配置失败: {e}")
-
-    def save_alerts_config(self):
-        try:
-            to_save = {}
-            for bank in ['zheshang', 'minsheng']:
-                to_save[bank] = {
-                    "enabled": self.alerts[bank]["enabled"],
-                    "upper": self.alerts[bank]["upper"],
-                    "lower": self.alerts[bank]["lower"]
-                }
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(to_save, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"保存预警配置失败: {e}")
-
-    # ---------- 预警设置窗口界面初始化 ----------
+    # ---------- 设置窗口界面初始化 ----------
     def show_alert_settings(self):
         win = tk.Toplevel(self.root)
         win.title("价格预警设置")
-        win.geometry("330x200")
+        win.geometry("550x450")
         win.attributes('-topmost', True)
         win.resizable(False, False)
         win.grab_set()
@@ -149,12 +123,12 @@ class GoldPriceMonitor:
 
         btn_frame = tk.Frame(win)
         btn_frame.pack(pady=10)
-        tk.Button(btn_frame, text="保存", command=lambda: self._save_alert_settings(
+        tk.Button(btn_frame, text="保存", command=lambda: self._save_all_settings(
             win)).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="取消", command=win.destroy).pack(
             side=tk.LEFT, padx=5)
 
-    # ---------- 预警界面金额初始化 ----------
+    # ---------- 创建预警设置界面 ----------
     def _create_alert_ui(self, parent, bank_key):
         bank_name = "浙商" if bank_key == "zheshang" else "民生"
         self.load_alerts_config()
@@ -232,12 +206,12 @@ class GoldPriceMonitor:
         self.subject_prefix_entry.insert(0, self.mail_config["subject_prefix"])
         self.subject_prefix_entry.grid(row=6, column=1, sticky='w', padx=5)
 
-    # ---------- 保存预警配置 ----------
-    def _save_alert_settings(self, win):
+    # ---------- 保存配置 ----------
+    def _save_all_settings(self, win):
+        # 保存预警配置
         zsh_frame = win.zsh_frame
         ms_frame = win.ms_frame
 
-        # 浙商
         self.alerts["zheshang"]["enabled"] = zsh_frame.enabled_var.get()
         upper_str = zsh_frame.upper_entry.get().strip()
         lower_str = zsh_frame.lower_entry.get().strip()
@@ -246,7 +220,6 @@ class GoldPriceMonitor:
         self.alerts["zheshang"]["lower"] = float(
             lower_str) if lower_str else None
 
-        # 民生
         self.alerts["minsheng"]["enabled"] = ms_frame.enabled_var.get()
         upper_str = ms_frame.upper_entry.get().strip()
         lower_str = ms_frame.lower_entry.get().strip()
@@ -255,7 +228,21 @@ class GoldPriceMonitor:
         self.alerts["minsheng"]["lower"] = float(
             lower_str) if lower_str else None
 
-        self.save_alerts_config()
+        # 保存邮件配置
+        self.mail_config["enabled"] = self.mail_enabled_var.get()
+        self.mail_config["smtp_server"] = self.smtp_server_entry.get().strip()
+        self.mail_config["smtp_port"] = int(self.smtp_port_entry.get().strip())
+        self.mail_config["sender_email"] = self.sender_email_entry.get().strip()
+        self.mail_config["sender_password"] = self.sender_pwd_entry.get(
+        ).strip()
+        self.mail_config["receiver_email"] = self.receiver_email_entry.get(
+        ).strip()
+        self.mail_config["subject_prefix"] = self.subject_prefix_entry.get(
+        ).strip()
+
+        # 保存到文件
+        self.save_alerts_config()   # 注意：需要修改此方法同时保存邮件配置
+        self.save_mail_config()     # 可合并为一个保存方法
         win.destroy()
 
     # ---------- 预警检查 ----------
@@ -284,8 +271,37 @@ class GoldPriceMonitor:
     def show_alert_dialog(self, bank_name, price, alert_type, threshold):
         msg = f"{bank_name} 金价 {price:.2f} 元/克\n{alert_type} {threshold:.2f} 元/克"
         self.root.after(0, lambda: messagebox.showwarning("金价预警", msg))
+        # 发送邮件（在子线程中，避免阻塞）
+        threading.Thread(target=self.send_mail_alert, args=(bank_name, price, alert_type, threshold), daemon=True).start()
 
-     # ---------- 加载邮件配置 ----------
+    # ---------- 加载预警配置 ----------
+    def load_alerts_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                    for bank in ['zheshang', 'minsheng']:
+                        if bank in saved:
+                            self.alerts[bank].update(saved[bank])
+            except Exception as e:
+                print(f"加载预警配置失败: {e}")
+
+    # ---------- 保存预警配置 ----------
+    def save_alerts_config(self):
+        try:
+            to_save = {}
+            for bank in ['zheshang', 'minsheng']:
+                to_save[bank] = {
+                    "enabled": self.alerts[bank]["enabled"],
+                    "upper": self.alerts[bank]["upper"],
+                    "lower": self.alerts[bank]["lower"]
+                }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(to_save, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"保存预警配置失败: {e}")
+
+    # ---------- 加载邮件配置 ----------
     def load_mail_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -311,6 +327,41 @@ class GoldPriceMonitor:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"保存邮件配置失败: {e}")
+
+    # ---------- 发送邮件预警（在子线程中运行） ----------
+    def send_mail_alert(self, bank_name, price, alert_type, threshold):
+        if not self.mail_config["enabled"]:
+            return
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.header import Header
+
+            msg = MIMEText(f"""
+                金价预警
+
+                银行：{bank_name}
+                当前价格：{price:.2f} 元/克
+                触发类型：{alert_type}
+                阈值：{threshold:.2f} 元/克
+                时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
+            """, "plain", "utf-8")
+            msg['Subject'] = Header(
+                f"{self.mail_config['subject_prefix']}{bank_name}金价{alert_type}", "utf-8")
+            msg['From'] = self.mail_config["sender_email"]
+            msg['To'] = self.mail_config["receiver_email"]
+
+            server = smtplib.SMTP(
+                self.mail_config["smtp_server"], self.mail_config["smtp_port"])
+            server.starttls()
+            server.login(self.mail_config["sender_email"],
+                        self.mail_config["sender_password"])
+            server.sendmail(self.mail_config["sender_email"], [
+                            self.mail_config["receiver_email"]], msg.as_string())
+            server.quit()
+            print(f"邮件预警已发送至 {self.mail_config['receiver_email']}")
+        except Exception as e:
+            print(f"发送邮件失败: {e}")
 
     # ---------- 悬浮窗（主窗口） ----------
     def create_floating_window(self):
@@ -400,11 +451,11 @@ class GoldPriceMonitor:
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", self.show_window, default=True),
             pystray.MenuItem("隐藏窗口", self.hide_window),
-            pystray.MenuItem("预警设置", self.show_alert_settings),
             pystray.MenuItem("停止刷新", self.tray_stop_monitor,
                              enabled=lambda item: self.is_active),
             pystray.MenuItem("继续刷新", self.tray_resume_monitor,
                              enabled=lambda item: not self.is_active),
+            pystray.MenuItem("设置", self.show_alert_settings),
             pystray.MenuItem("退出", self.quit_app)
         )
         return pystray.Icon("gold_monitor", image, "金价监控", menu)
