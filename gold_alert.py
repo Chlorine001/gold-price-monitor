@@ -105,7 +105,9 @@ class MailConfig:
 @dataclass
 class AppConfig:
     refresh_interval: int = DEFAULT_REFRESH_INTERVAL
-    alert_cooldown_seconds: int = ALERT_COOLDOWN_SECONDS   # 新增：预警冷却时间
+    alert_cooldown_seconds: int = ALERT_COOLDOWN_SECONDS   # 预警冷却时间
+    window_x: Optional[int] = None
+    window_y: Optional[int] = None
     alerts: Dict[str, AlertConfig] = None
     mail: MailConfig = None
 
@@ -118,9 +120,18 @@ class AppConfig:
         if self.mail is None:
             self.mail = MailConfig()
 
+# 添加全局函数
+
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
 # ------------------ 主类 ------------------
-
-
 class GoldPriceMonitor:
     def __init__(self):
         self.config = self.load_config()
@@ -152,6 +163,8 @@ class GoldPriceMonitor:
                 "refresh_interval", DEFAULT_REFRESH_INTERVAL)
             cfg.alert_cooldown_seconds = data.get(
                 "alert_cooldown_seconds", ALERT_COOLDOWN_SECONDS)   # 新增
+            cfg.window_x = data.get("window_x")          # 可能为 None
+            cfg.window_y = data.get("window_y")
 
             # 加载预警配置
             for bank in ["zheshang", "minsheng"]:
@@ -199,6 +212,8 @@ class GoldPriceMonitor:
             data = {
                 "refresh_interval": self.config.refresh_interval,
                 "alert_cooldown_seconds": self.config.alert_cooldown_seconds,   # 新增
+                "window_x": self.config.window_x,          # 新增
+                "window_y": self.config.window_y,          # 新增
                 "alerts": {
                     bank: {
                         "enabled": cfg.enabled,
@@ -348,7 +363,12 @@ class GoldPriceMonitor:
         self.floating.overrideredirect(True)
         self.floating.attributes('-topmost', True)
         self.floating.attributes('-alpha', 0.85)
-        self.floating.geometry("260x120+50+50")
+
+        # 设置初始位置：如果配置中有坐标，则使用，否则默认 (50, 50)
+        x = self.config.window_x if self.config.window_x is not None else 50
+        y = self.config.window_y if self.config.window_y is not None else 50
+        self.floating.geometry(f"260x120+{x}+{y}")
+
         self.floating.configure(bg='#2c3e50')
         self.floating.wm_attributes('-transparentcolor', '#2c3e50')
 
@@ -392,6 +412,8 @@ class GoldPriceMonitor:
     def on_move(self, event):
         x = event.x_root - self.drag_x
         y = event.y_root - self.drag_y
+        self.config.window_x = x
+        self.config.window_y = y
         self.floating.geometry(f"+{x}+{y}")
 
     def show_context_menu(self, event):
@@ -438,6 +460,13 @@ class GoldPriceMonitor:
             win)).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="取消", command=win.destroy).pack(
             side=tk.LEFT, padx=5)
+
+    def reset_window_position(self):
+        self.config.window_x = None
+        self.config.window_y = None
+        self.save_config()
+        # 立即移动窗口到默认位置
+        self.floating.geometry("+50+50")
 
     def _create_alert_ui(self, parent, bank_key):
         cfg = self.config.alerts[bank_key]
@@ -512,6 +541,8 @@ class GoldPriceMonitor:
         self.refresh_interval_entry.insert(
             0, str(self.config.refresh_interval))
         self.refresh_interval_entry.grid(row=0, column=1, sticky='w', padx=5)
+        tk.Button(parent, text="重置窗口位置", command=self.reset_window_position).grid(
+            row=2, column=0, columnspan=2, pady=5)
 
         # 新增冷却时间输入框
         tk.Label(parent, text="预警冷却时间 (秒):").grid(
@@ -616,8 +647,8 @@ class GoldPriceMonitor:
         self.is_active = True
         self.root.after(0, self.update_gui)
         logger.info("监控已恢复")
-
     # ---------- 系统托盘 ----------
+
     def setup_tray(self):
         if not PYSTRAY_AVAILABLE:
             logger.warning("pystray 未安装，系统托盘功能不可用")
@@ -628,9 +659,7 @@ class GoldPriceMonitor:
         self.root.after(100, self.update_tray_tooltip)
 
     def create_tray_icon(self):
-        # 获取图片的绝对路径（假设图片放在脚本所在目录的 icons 文件夹下）
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(base_dir, "icons", "gold-price.ico")
+        icon_path = resource_path("icons/gold_icon.ico")
         try:
             image = Image.open(icon_path)
             # 统一缩放到 64x64（可选）
@@ -696,6 +725,8 @@ class GoldPriceMonitor:
 
     # ---------- 退出 ----------
     def quit_app(self, item=None):
+        self.save_config()
+        logger.info(self.config.window_x)
         logger.info("程序退出")
         if PYSTRAY_AVAILABLE and hasattr(self, 'tray_icon') and self.tray_icon is not None:
             self.tray_icon.stop()
