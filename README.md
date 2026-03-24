@@ -6,8 +6,6 @@
 
 一个基于 Python 的实时金价监控工具，支持悬浮窗显示、价格预警和邮件通知功能。可监控**浙商银行**和**民生银行**的实时黄金价格。
 
-![悬浮窗预览](https://via.placeholder.com/400x150/2c3e50/ecf0f1?text=Gold+Monitor+Floating+Window)
-
 ---
 
 ## ✨ 功能特性
