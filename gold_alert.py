@@ -94,7 +94,7 @@ class GoldPriceMonitor:
     # ---------- 设置窗口界面初始化 ----------
     def show_alert_settings(self):
         win = tk.Toplevel(self.root)
-        win.title("价格预警设置")
+        win.title("设置")
         win.geometry("550x450")
         win.attributes('-topmost', True)
         win.resizable(False, False)
