@@ -1,0 +1,12 @@
+{
+  "zheshang": {
+    "enabled": true,
+    "upper": 970.0,
+    "lower": 950.0
+  },
+  "minsheng": {
+    "enabled": true,
+    "upper": 1000.0,
+    "lower": 900.0
+  }
+}
