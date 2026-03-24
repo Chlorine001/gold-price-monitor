@@ -1,17 +1,24 @@
 """
-金价实时监控（悬浮窗版）
-version: 3.0
+金价实时监控（悬浮窗版 + 价格预警）
+version: 4.0
+功能：
+- 实时获取浙商和民生金价
+- 悬浮窗（无边框、置顶、半透明、可拖动）
+- 系统托盘图标，支持显示/隐藏、暂停/继续刷新
+- 价格预警（上下限阈值设置），触发时弹窗提醒，10分钟内不重复
+- 预警配置持久化（gold_alerts.json）
 """
 
 import requests
 import tkinter as tk
+from tkinter import messagebox, ttk
 import threading
 import time
 import json
 import sys
+import os
 from PIL import Image, ImageDraw
 
-# 尝试导入 pystray
 try:
     import pystray
     PYSTRAY_AVAILABLE = True
@@ -19,11 +26,15 @@ except ImportError:
     PYSTRAY_AVAILABLE = False
     print("未安装 pystray，系统托盘功能不可用。可运行: pip install pystray pillow")
 
-# 默认配置
+# API 地址
 ZSH_URL = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816"
 MS_URL = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice"
-DEFAULT_REFRESH_INTERVAL = 1  # 秒
-DEBUG = False
+
+# 配置
+DEFAULT_REFRESH_INTERVAL = 1   # 刷新间隔（秒）
+ALERT_COOLDOWN_SECONDS = 5   # 预警冷却时间（秒），同一类型预警在此时间内不重复
+CONFIG_FILE = "gold_alerts.json"
+DEBUG = False                   # 调试开关，打印原始响应
 
 
 class GoldPriceMonitor:
@@ -35,14 +46,33 @@ class GoldPriceMonitor:
         self.zsh_data = {"price": None, "change": None, "error": None}
         self.ms_data = {"price": None, "change": None, "error": None}
 
-        # 创建主窗口（作为隐藏的根窗口，用于管理事件循环）
+        # 预警配置
+        self.alerts = {
+            "zheshang": {
+                "enabled": True,
+                "upper": None,
+                "lower": None,
+                "last_alert_upper": 0,
+                "last_alert_lower": 0
+            },
+            "minsheng": {
+                "enabled": True,
+                "upper": None,
+                "lower": None,
+                "last_alert_upper": 0,
+                "last_alert_lower": 0
+            }
+        }
+        self.load_alerts_config()
+
+        # 创建根窗口（隐藏，用于事件循环）
         self.root = tk.Tk()
-        self.root.withdraw()  # 隐藏根窗口
+        self.root.withdraw()
 
         # 创建悬浮窗
         self.create_floating_window()
 
-        # 创建托盘图标
+        # 创建系统托盘
         self.setup_tray()
 
         # 启动数据获取线程
@@ -50,98 +80,218 @@ class GoldPriceMonitor:
             target=self.fetch_loop, daemon=True)
         self.fetch_thread.start()
 
-        # 窗口关闭时退出
+        # 关闭窗口时退出程序
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
+    # ---------- 预警配置持久化 ----------
+    def load_alerts_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                    for bank in ['zheshang', 'minsheng']:
+                        if bank in saved:
+                            self.alerts[bank].update(saved[bank])
+            except Exception as e:
+                print(f"加载预警配置失败: {e}")
+
+    def save_alerts_config(self):
+        try:
+            to_save = {}
+            for bank in ['zheshang', 'minsheng']:
+                to_save[bank] = {
+                    "enabled": self.alerts[bank]["enabled"],
+                    "upper": self.alerts[bank]["upper"],
+                    "lower": self.alerts[bank]["lower"]
+                }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(to_save, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"保存预警配置失败: {e}")
+
+    # ---------- 预警设置窗口 ----------
+    def show_alert_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("价格预警设置")
+        win.geometry("330x200")
+        win.attributes('-topmost', True)
+        win.resizable(False, False)
+        win.grab_set()
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 浙商选项卡
+        zsh_frame = ttk.Frame(nb)
+        nb.add(zsh_frame, text="浙商金价")
+        self._create_alert_ui(zsh_frame, "zheshang")
+        win.zsh_frame = zsh_frame
+
+        # 民生选项卡
+        ms_frame = ttk.Frame(nb)
+        nb.add(ms_frame, text="民生金价")
+        self._create_alert_ui(ms_frame, "minsheng")
+        win.ms_frame = ms_frame
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="保存", command=lambda: self._save_alert_settings(
+            win)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="取消", command=win.destroy).pack(
+            side=tk.LEFT, padx=5)
+
+    def _create_alert_ui(self, parent, bank_key):
+        bank_name = "浙商" if bank_key == "zheshang" else "民生"
+        cfg = self.alerts[bank_key]
+
+        enabled_var = tk.BooleanVar(value=cfg["enabled"])
+        tk.Checkbutton(parent, text=f"启用{bank_name}金价预警", variable=enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=5)
+
+        tk.Label(parent, text="上限价格（高于此值预警）:").grid(
+            row=1, column=0, sticky='e', padx=5, pady=5)
+        upper_entry = tk.Entry(parent, width=15)
+        upper_entry.insert(0, str(cfg["upper"])
+                           if cfg["upper"] is not None else "")
+        upper_entry.grid(row=1, column=1, sticky='w', padx=5)
+
+        tk.Label(parent, text="下限价格（低于此值预警）:").grid(
+            row=2, column=0, sticky='e', padx=5, pady=5)
+        lower_entry = tk.Entry(parent, width=15)
+        lower_entry.insert(0, str(cfg["lower"])
+                           if cfg["lower"] is not None else "")
+        lower_entry.grid(row=2, column=1, sticky='w', padx=5)
+
+        parent.enabled_var = enabled_var
+        parent.upper_entry = upper_entry
+        parent.lower_entry = lower_entry
+
+    def _save_alert_settings(self, win):
+        zsh_frame = win.zsh_frame
+        ms_frame = win.ms_frame
+
+        # 浙商
+        self.alerts["zheshang"]["enabled"] = zsh_frame.enabled_var.get()
+        upper_str = zsh_frame.upper_entry.get().strip()
+        lower_str = zsh_frame.lower_entry.get().strip()
+        self.alerts["zheshang"]["upper"] = float(
+            upper_str) if upper_str else None
+        self.alerts["zheshang"]["lower"] = float(
+            lower_str) if lower_str else None
+
+        # 民生
+        self.alerts["minsheng"]["enabled"] = ms_frame.enabled_var.get()
+        upper_str = ms_frame.upper_entry.get().strip()
+        lower_str = ms_frame.lower_entry.get().strip()
+        self.alerts["minsheng"]["upper"] = float(
+            upper_str) if upper_str else None
+        self.alerts["minsheng"]["lower"] = float(
+            lower_str) if lower_str else None
+
+        self.save_alerts_config()
+        win.destroy()
+
+    # ---------- 预警检查 ----------
+    def check_and_alert(self, bank_key, price, current_time):
+        cfg = self.alerts[bank_key]
+        if not cfg["enabled"]:
+            return
+        bank_name = "浙商" if bank_key == "zheshang" else "民生"
+
+        # 上限
+        if cfg["upper"] is not None and price > cfg["upper"]:
+            if current_time - cfg["last_alert_upper"] > ALERT_COOLDOWN_SECONDS:
+                cfg["last_alert_upper"] = current_time
+                self.show_alert_dialog(bank_name, price, "高于上限", cfg["upper"])
+                self.save_alerts_config()
+
+        # 下限
+        if cfg["lower"] is not None and price < cfg["lower"]:
+            if current_time - cfg["last_alert_lower"] > ALERT_COOLDOWN_SECONDS:
+                cfg["last_alert_lower"] = current_time
+                self.show_alert_dialog(bank_name, price, "低于下限", cfg["lower"])
+                self.save_alerts_config()
+
+    def show_alert_dialog(self, bank_name, price, alert_type, threshold):
+        msg = f"{bank_name} 金价 {price:.2f} 元/克\n{alert_type} {threshold:.2f} 元/克"
+        self.root.after(0, lambda: messagebox.showwarning("金价预警", msg))
+
+    # ---------- 悬浮窗 ----------
     def create_floating_window(self):
-        """创建无边框、置顶、半透明的悬浮窗"""
         self.floating = tk.Toplevel(self.root)
         self.floating.title("金价监控")
-        self.floating.overrideredirect(True)  # 无边框
-        self.floating.attributes('-topmost', True)  # 置顶
-        self.floating.attributes('-alpha', 0.85)  # 半透明（0.0-1.0）
-        self.floating.geometry("260x120+50+50")  # 初始位置 (50,50)
-
-        # 背景色和字体
+        self.floating.overrideredirect(True)
+        self.floating.attributes('-topmost', True)
+        self.floating.attributes('-alpha', 0.85)
+        self.floating.geometry("260x120+50+50")
         self.floating.configure(bg='#2c3e50')
-        self.floating.wm_attributes(
-            '-transparentcolor', '#2c3e50')  # 设置透明色（可选）
+        self.floating.wm_attributes('-transparentcolor', '#2c3e50')
 
-        # 内容框架（用于放置标签）
         self.frame = tk.Frame(self.floating, bg='#2c3e50')
         self.frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # 浙商标签
         self.zsh_label = tk.Label(
             self.frame, text="浙商: 等待数据", font=("微软雅黑", 12),
             fg='#ecf0f1', bg='#2c3e50'
         )
         self.zsh_label.pack(anchor='w', pady=2)
 
-        # 民生标签
         self.ms_label = tk.Label(
             self.frame, text="民生: 等待数据", font=("微软雅黑", 12),
             fg='#ecf0f1', bg='#2c3e50'
         )
         self.ms_label.pack(anchor='w', pady=2)
 
-        # 涨跌标签（整合到一行或单独显示）
         self.change_label = tk.Label(
             self.frame, text="", font=("微软雅黑", 10),
             fg='#bdc3c7', bg='#2c3e50'
         )
         self.change_label.pack(anchor='w', pady=2)
 
-        # 状态标签（显示运行/暂停）
         self.status_label = tk.Label(
             self.frame, text="● 运行中", font=("微软雅黑", 9),
             fg='#2ecc71', bg='#2c3e50'
         )
         self.status_label.pack(anchor='w', pady=2)
 
-        # 绑定鼠标事件，支持拖动
-        self.floating.bind('<Button-1>', self.start_move)
-        self.floating.bind('<B1-Motion>', self.on_move)
+        # 拖动
+        self.floating.bind('<Any-Button-1>', self.start_move)
+        self.floating.bind('<Any-B1-Motion>', self.on_move)
+        self.floating.config(cursor='fleur')
 
-        # 右键菜单（在悬浮窗上右键）
+        # 右键菜单
         self.floating.bind('<Button-3>', self.show_context_menu)
-
-        # 创建右键菜单
         self.context_menu = tk.Menu(self.floating, tearoff=0)
         self.context_menu.add_command(label="隐藏窗口", command=self.hide_window)
+        self.context_menu.add_command(
+            label="预警设置", command=self.show_alert_settings)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="停止刷新", command=self.stop_monitor)
         self.context_menu.add_command(
             label="继续刷新", command=self.resume_monitor)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="退出", command=self.quit_app)
 
-    def show_context_menu(self, event):
-        """显示右键菜单"""
-        self.context_menu.post(event.x_root, event.y_root)
-
     def start_move(self, event):
-        """开始拖动"""
-        self.x = event.x
-        self.y = event.y
+        self.drag_x = event.x_root - self.floating.winfo_x()
+        self.drag_y = event.y_root - self.floating.winfo_y()
 
     def on_move(self, event):
-        """拖动中"""
-        deltax = event.x - self.x
-        deltay = event.y - self.y
-        x = self.floating.winfo_x() + deltax
-        y = self.floating.winfo_y() + deltay
+        x = event.x_root - self.drag_x
+        y = event.y_root - self.drag_y
         self.floating.geometry(f"+{x}+{y}")
 
+    def show_context_menu(self, event):
+        self.context_menu.post(event.x_root, event.y_root)
+
     def hide_window(self):
-        """隐藏悬浮窗"""
         self.floating.withdraw()
 
     def show_window(self):
-        """显示悬浮窗"""
         self.floating.deiconify()
         self.floating.lift()
 
-    # ----- 托盘相关 -----
+    # ---------- 系统托盘 ----------
     def create_tray_icon(self):
         size = 64
         image = Image.new('RGB', (size, size), color=(255, 215, 0))
@@ -154,6 +304,7 @@ class GoldPriceMonitor:
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", self.show_window, default=True),
             pystray.MenuItem("隐藏窗口", self.hide_window),
+            pystray.MenuItem("预警设置", self.show_alert_settings),
             pystray.MenuItem("停止刷新", self.tray_stop_monitor,
                              enabled=lambda item: self.is_active),
             pystray.MenuItem("继续刷新", self.tray_resume_monitor,
@@ -164,7 +315,6 @@ class GoldPriceMonitor:
 
     def setup_tray(self):
         if not PYSTRAY_AVAILABLE:
-            print("系统托盘不可用，仅使用悬浮窗模式。")
             return
         self.tray_icon = self.create_tray_icon()
         threading.Thread(target=self.tray_icon.run_detached,
@@ -172,7 +322,6 @@ class GoldPriceMonitor:
         self.root.after(100, self.update_tray_tooltip)
 
     def update_tray_tooltip(self):
-        """更新托盘悬浮提示"""
         if not PYSTRAY_AVAILABLE or not hasattr(self, 'tray_icon') or self.tray_icon is None:
             return
         with self.lock:
@@ -198,7 +347,7 @@ class GoldPriceMonitor:
         else:
             lines.append("民生: 等待数据")
 
-        tooltip = "/n".join(lines)
+        tooltip = "\n".join(lines)
         self.tray_icon.title = tooltip
         self.root.after(1000, self.update_tray_tooltip)
 
@@ -208,7 +357,7 @@ class GoldPriceMonitor:
     def tray_resume_monitor(self, item=None):
         self.resume_monitor()
 
-    # ----- 数据获取 -----
+    # ---------- 数据获取与更新 ----------
     def fetch_single(self, url, source_name):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -236,19 +385,29 @@ class GoldPriceMonitor:
             if not self.is_active:
                 time.sleep(self.interval)
                 continue
+
             price_z, change_z, err_z = self.fetch_single(ZSH_URL, "zheshang")
             with self.lock:
                 self.zsh_data = {"price": price_z,
                                  "change": change_z, "error": err_z}
+
             price_m, change_m, err_m = self.fetch_single(MS_URL, "minsheng")
             with self.lock:
                 self.ms_data = {"price": price_m,
                                 "change": change_m, "error": err_m}
+
             self.root.after(0, self.update_gui)
+
+            # 预警检查
+            current_time = time.time()
+            if price_z is not None and not err_z:
+                self.check_and_alert("zheshang", price_z, current_time)
+            if price_m is not None and not err_m:
+                self.check_and_alert("minsheng", price_m, current_time)
+
             time.sleep(self.interval)
 
     def update_gui(self):
-        """更新悬浮窗显示"""
         with self.lock:
             zsh = self.zsh_data
             ms = self.ms_data
@@ -269,7 +428,7 @@ class GoldPriceMonitor:
         else:
             ms_text = "民生: 等待数据"
 
-        # 涨跌幅信息（合并显示）
+        # 涨跌幅
         change_text = ""
         if zsh["price"] is not None and not zsh["error"]:
             change_z = zsh["change"]
@@ -280,12 +439,10 @@ class GoldPriceMonitor:
             sign_m = "+" if change_m >= 0 else ""
             change_text += f"民生涨跌: {sign_m}{change_m:.2f}"
 
-        # 更新标签
         self.zsh_label.config(text=zsh_text)
         self.ms_label.config(text=ms_text)
         self.change_label.config(text=change_text)
 
-        # 更新状态标签（运行/暂停）
         if self.is_active:
             self.status_label.config(text="● 运行中", fg='#2ecc71')
         else:
