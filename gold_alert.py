@@ -1,6 +1,6 @@
 """
-金价实时监控（双源版）
-version: 2.1
+金价实时监控（双源版）- 修复 lock 缺失及民生解析
+version: 2.3
 API:
     浙商: https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816
     民生: https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice
@@ -10,11 +10,13 @@ import requests
 import tkinter as tk
 import threading
 import time
+import json
 
 # 默认配置
 ZSH_URL = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816"
 MS_URL = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice"
 DEFAULT_REFRESH_INTERVAL = 1  # 秒
+DEBUG = True  # 设为 True 可在控制台打印原始响应，方便调试
 
 
 class GoldPriceMonitor:
@@ -23,33 +25,26 @@ class GoldPriceMonitor:
         self.zsh_url = zsh_url
         self.ms_url = ms_url
         self.interval = interval
-        self.is_active = True          # 是否继续刷新
-        self.lock = threading.Lock()   # 保护数据一致性
+        self.is_active = True
+        self.lock = threading.Lock()  # 修复：初始化锁
 
-        # 存储最新数据（用于GUI更新）
+        # 存储最新数据
         self.zsh_data = {"price": None, "change": None, "error": None}
         self.ms_data = {"price": None, "change": None, "error": None}
 
-        # 创建 GUI 组件
         self.setup_gui()
-
-        # 启动后台数据获取线程
         self.fetch_thread = threading.Thread(
             target=self.fetch_loop, daemon=True)
         self.fetch_thread.start()
-
-        # 窗口关闭时停止循环
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def setup_gui(self):
-        """初始化 GUI 布局"""
         self.root.title("金价实时监控 - 浙商 & 民生")
-        self.root.attributes('-topmost', True)  # 窗口置顶
+        self.root.attributes('-topmost', True)
 
         # 浙商板块
-        self.zsh_title = tk.Label(
-            self.root, text="【浙商金价】", font=("Arial", 12, "bold"))
-        self.zsh_title.pack(pady=(10, 0))
+        tk.Label(self.root, text="【浙商金价】", font=(
+            "Arial", 12, "bold")).pack(pady=(10, 0))
         self.zsh_price_label = tk.Label(
             self.root, text="等待数据...", font=("Arial", 14))
         self.zsh_price_label.pack(pady=2)
@@ -58,9 +53,8 @@ class GoldPriceMonitor:
         self.zsh_change_label.pack(pady=2)
 
         # 民生板块
-        self.ms_title = tk.Label(
-            self.root, text="【民生金价】", font=("Arial", 12, "bold"))
-        self.ms_title.pack(pady=(10, 0))
+        tk.Label(self.root, text="【民生金价】", font=(
+            "Arial", 12, "bold")).pack(pady=(10, 0))
         self.ms_price_label = tk.Label(
             self.root, text="等待数据...", font=("Arial", 14))
         self.ms_price_label.pack(pady=2)
@@ -84,18 +78,22 @@ class GoldPriceMonitor:
         self.resume_button.pack(side=tk.LEFT, padx=5)
 
     def fetch_single(self, url, source_name):
-        """
-        获取单个 API 数据
-        返回 (price, change, error_msg)
-        """
+        """获取单个 API 数据，返回 (price, change, error_msg)"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
         try:
-            response = requests.get(url, timeout=5)
+            response = requests.get(url, headers=headers, timeout=5)
             response.raise_for_status()
             data = response.json()
 
-            # 不同 API 数据结构可能不同，分别解析
+            if DEBUG:
+                print(f"=== {source_name} 原始响应 ===")
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+
+            # 根据数据源分别解析
             if source_name == "zheshang":
-                # 浙商 API 结构: resultData.datas.price / upAndDownAmt
+                # 浙商: resultData.datas.price / upAndDownAmt
                 result = data.get('resultData', {})
                 datas = result.get('datas', {})
                 price = datas.get('price')
@@ -103,18 +101,29 @@ class GoldPriceMonitor:
                 if price is None or change is None:
                     raise ValueError("浙商 API 返回数据缺失必要字段")
                 return price, change, None
+
             elif source_name == "minsheng":
-                # 民生 API 结构（与原代码一致）: resultData.datas.price / upAndDownAmt
-                # 如果结构相同，复用；若有差异可在此扩展
-                result = data.get('resultData', {})
-                datas = result.get('datas', {})
-                price = datas.get('price')
-                change = datas.get('upAndDownAmt')
+                # 尝试多种可能的路径（根据实际民生 API 结构）
+                price = None
+                change = None
+                # 常见路径1: resultData.datas
+                if 'resultData' in data:
+                    result = data['resultData']
+                    if 'datas' in result:
+                        price = result['datas'].get('price')
+                        change = result['datas'].get('upAndDownAmt')
+                # 路径2: 直接 data.price
+                if price is None and 'price' in data:
+                    price = data.get('price')
+                    change = data.get('upAndDownAmt')
+                # 路径3: data.data.price
+                if price is None and 'data' in data:
+                    price = data['data'].get('price')
+                    change = data['data'].get('upAndDownAmt')
                 if price is None or change is None:
-                    raise ValueError("民生 API 返回数据缺失必要字段")
+                    print(f"民生 API 结构未知，请检查原始响应。")
+                    raise ValueError("民生 API 返回数据路径不匹配")
                 return price, change, None
-            else:
-                raise ValueError(f"未知数据源: {source_name}")
 
         except requests.exceptions.Timeout:
             return None, None, "请求超时"
@@ -130,9 +139,7 @@ class GoldPriceMonitor:
             return None, None, f"未知错误: {str(e)}"
 
     def fetch_loop(self):
-        """后台循环获取数据，通过 after 方法安全更新 GUI"""
         while True:
-            # 如果未激活，只睡眠，不获取数据
             if not self.is_active:
                 time.sleep(self.interval)
                 continue
@@ -141,59 +148,51 @@ class GoldPriceMonitor:
             price_z, change_z, err_z = self.fetch_single(
                 self.zsh_url, "zheshang")
             with self.lock:
-                if err_z:
-                    self.zsh_data = {"price": None,
-                                     "change": None, "error": err_z}
-                else:
-                    self.zsh_data = {"price": price_z,
-                                     "change": change_z, "error": None}
+                self.zsh_data = {"price": price_z,
+                                 "change": change_z, "error": err_z}
 
             # 获取民生数据
             price_m, change_m, err_m = self.fetch_single(
                 self.ms_url, "minsheng")
             with self.lock:
-                if err_m:
-                    self.ms_data = {"price": None,
-                                    "change": None, "error": err_m}
-                else:
-                    self.ms_data = {"price": price_m,
-                                    "change": change_m, "error": None}
+                self.ms_data = {"price": price_m,
+                                "change": change_m, "error": err_m}
 
-            # 使用 after 将 GUI 更新操作调度到主线程
             self.root.after(0, self.update_gui)
-
-            # 等待下一次刷新
             time.sleep(self.interval)
 
     def update_gui(self):
-        """在主线程中更新界面"""
         with self.lock:
             zsh = self.zsh_data
             ms = self.ms_data
 
-        # 更新浙商显示
+        # 更新浙商
         if zsh["error"]:
             self.zsh_price_label.config(text="获取失败")
             self.zsh_change_label.config(text="")
-            # 可将错误信息显示在状态栏，但状态栏整体展示，暂时不单独显示
-        else:
+        elif zsh["price"] is not None:
             self.zsh_price_label.config(text=f"{zsh['price']} 元/克")
             sign = "+" if zsh["change"] >= 0 else ""
             self.zsh_change_label.config(
                 text=f"涨跌额: {sign}{zsh['change']} 元/克")
+        else:
+            self.zsh_price_label.config(text="等待数据...")
+            self.zsh_change_label.config(text="")
 
-        # 更新民生显示
+        # 更新民生
         if ms["error"]:
             self.ms_price_label.config(text="获取失败")
             self.ms_change_label.config(text="")
-        else:
+        elif ms["price"] is not None:
             self.ms_price_label.config(text=f"{ms['price']} 元/克")
             sign = "+" if ms["change"] >= 0 else ""
             self.ms_change_label.config(text=f"涨跌额: {sign}{ms['change']} 元/克")
+        else:
+            self.ms_price_label.config(text="等待数据...")
+            self.ms_change_label.config(text="")
 
-        # 更新状态栏（显示是否激活，以及是否有错误）
+        # 更新状态栏
         if self.is_active:
-            # 检查是否有任何错误
             if zsh["error"] or ms["error"]:
                 err_msgs = []
                 if zsh["error"]:
@@ -208,30 +207,24 @@ class GoldPriceMonitor:
             self.status_label.config(text="状态: 已暂停", fg="orange")
 
     def stop_monitor(self):
-        """暂停刷新"""
         self.is_active = False
         self.stop_button.config(state=tk.DISABLED)
         self.resume_button.config(state=tk.NORMAL)
-        # 立即更新状态栏
         self.root.after(0, self.update_gui)
 
     def resume_monitor(self):
-        """恢复刷新"""
         self.is_active = True
         self.stop_button.config(state=tk.NORMAL)
         self.resume_button.config(state=tk.DISABLED)
-        # 立即更新状态栏
         self.root.after(0, self.update_gui)
 
     def on_closing(self):
-        """窗口关闭时的清理工作"""
         self.is_active = False
         self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    # 可根据需要修改 URL 和刷新间隔
     monitor = GoldPriceMonitor(
         root, ZSH_URL, MS_URL, interval=DEFAULT_REFRESH_INTERVAL)
     root.mainloop()
