@@ -628,13 +628,23 @@ class GoldPriceMonitor:
         self.root.after(100, self.update_tray_tooltip)
 
     def create_tray_icon(self):
-        size = 64
-        image = Image.new('RGB', (size, size), color=(255, 215, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle([size//4, size//4, size*3//4,
-                       size*3//4], fill=(255, 140, 0))
-        draw.ellipse([size//3, size//3, size*2//3,
-                     size*2//3], fill=(255, 215, 0))
+        # 获取图片的绝对路径（假设图片放在脚本所在目录的 icons 文件夹下）
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_dir, "icons", "gold-price.ico")
+        try:
+            image = Image.open(icon_path)
+            # 统一缩放到 64x64（可选）
+            image = image.resize((64, 64), Image.Resampling.LANCZOS)
+        except FileNotFoundError:
+            # 如果图片加载失败，回退到原来的绘制方式
+            logger.warning("icon加载失败")
+            size = 64
+            image = Image.new('RGB', (size, size), color=(255, 215, 0))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([size//4, size//4, size*3//4,
+                            size*3//4], fill=(255, 140, 0))
+            draw.ellipse([size//3, size//3, size*2//3,
+                          size*2//3], fill=(255, 215, 0))
 
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", self.show_window, default=True),
