@@ -1,9 +1,6 @@
 """
-金价实时监控（双源版）- 修复 lock 缺失及民生解析
+金价实时监控（双源版）- 修复涨跌幅字符串比较错误
 version: 2.3
-API:
-    浙商: https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816
-    民生: https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice
 """
 
 import requests
@@ -16,7 +13,7 @@ import json
 ZSH_URL = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice?productSku=1961543816"
 MS_URL = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice"
 DEFAULT_REFRESH_INTERVAL = 1  # 秒
-DEBUG = True  # 设为 True 可在控制台打印原始响应，方便调试
+DEBUG = False  # 调试开关，设为 True 可打印原始响应
 
 
 class GoldPriceMonitor:
@@ -26,9 +23,8 @@ class GoldPriceMonitor:
         self.ms_url = ms_url
         self.interval = interval
         self.is_active = True
-        self.lock = threading.Lock()  # 修复：初始化锁
+        self.lock = threading.Lock()
 
-        # 存储最新数据
         self.zsh_data = {"price": None, "change": None, "error": None}
         self.ms_data = {"price": None, "change": None, "error": None}
 
@@ -91,39 +87,19 @@ class GoldPriceMonitor:
                 print(f"=== {source_name} 原始响应 ===")
                 print(json.dumps(data, indent=2, ensure_ascii=False))
 
-            # 根据数据源分别解析
-            if source_name == "zheshang":
-                # 浙商: resultData.datas.price / upAndDownAmt
-                result = data.get('resultData', {})
-                datas = result.get('datas', {})
-                price = datas.get('price')
-                change = datas.get('upAndDownAmt')
-                if price is None or change is None:
-                    raise ValueError("浙商 API 返回数据缺失必要字段")
-                return price, change, None
+            # 两个 API 结构相同，统一解析
+            result = data.get('resultData', {})
+            datas = result.get('datas', {})
+            price_str = datas.get('price')
+            change_str = datas.get('upAndDownAmt')
 
-            elif source_name == "minsheng":
-                # 尝试多种可能的路径（根据实际民生 API 结构）
-                price = None
-                change = None
-                # 常见路径1: resultData.datas
-                if 'resultData' in data:
-                    result = data['resultData']
-                    if 'datas' in result:
-                        price = result['datas'].get('price')
-                        change = result['datas'].get('upAndDownAmt')
-                # 路径2: 直接 data.price
-                if price is None and 'price' in data:
-                    price = data.get('price')
-                    change = data.get('upAndDownAmt')
-                # 路径3: data.data.price
-                if price is None and 'data' in data:
-                    price = data['data'].get('price')
-                    change = data['data'].get('upAndDownAmt')
-                if price is None or change is None:
-                    print(f"民生 API 结构未知，请检查原始响应。")
-                    raise ValueError("民生 API 返回数据路径不匹配")
-                return price, change, None
+            if price_str is None or change_str is None:
+                raise ValueError(f"{source_name} API 返回数据缺失必要字段")
+
+            # 转换为浮点数以便比较和显示
+            price = float(price_str)
+            change = float(change_str)
+            return price, change, None
 
         except requests.exceptions.Timeout:
             return None, None, "请求超时"
@@ -171,10 +147,16 @@ class GoldPriceMonitor:
             self.zsh_price_label.config(text="获取失败")
             self.zsh_change_label.config(text="")
         elif zsh["price"] is not None:
-            self.zsh_price_label.config(text=f"{zsh['price']} 元/克")
-            sign = "+" if zsh["change"] >= 0 else ""
-            self.zsh_change_label.config(
-                text=f"涨跌额: {sign}{zsh['change']} 元/克")
+            # 显示价格（保留两位小数）
+            self.zsh_price_label.config(text=f"{zsh['price']:.2f} 元/克")
+            # 显示涨跌额，正数带加号
+            change_val = zsh["change"]
+            if isinstance(change_val, (int, float)):
+                sign = "+" if change_val >= 0 else ""
+                self.zsh_change_label.config(
+                    text=f"涨跌额: {sign}{change_val:.2f} 元/克")
+            else:
+                self.zsh_change_label.config(text=f"涨跌额: {change_val}")
         else:
             self.zsh_price_label.config(text="等待数据...")
             self.zsh_change_label.config(text="")
@@ -184,9 +166,14 @@ class GoldPriceMonitor:
             self.ms_price_label.config(text="获取失败")
             self.ms_change_label.config(text="")
         elif ms["price"] is not None:
-            self.ms_price_label.config(text=f"{ms['price']} 元/克")
-            sign = "+" if ms["change"] >= 0 else ""
-            self.ms_change_label.config(text=f"涨跌额: {sign}{ms['change']} 元/克")
+            self.ms_price_label.config(text=f"{ms['price']:.2f} 元/克")
+            change_val = ms["change"]
+            if isinstance(change_val, (int, float)):
+                sign = "+" if change_val >= 0 else ""
+                self.ms_change_label.config(
+                    text=f"涨跌额: {sign}{change_val:.2f} 元/克")
+            else:
+                self.ms_change_label.config(text=f"涨跌额: {change_val}")
         else:
             self.ms_price_label.config(text="等待数据...")
             self.ms_change_label.config(text="")
