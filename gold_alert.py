@@ -659,7 +659,7 @@ class GoldPriceMonitor:
         self.root.after(100, self.update_tray_tooltip)
 
     def create_tray_icon(self):
-        icon_path = resource_path("icons/gold_icon.ico")
+        icon_path = resource_path("icons\\gold_icon.ico")
         try:
             image = Image.open(icon_path)
             # 统一缩放到 64x64（可选）
@@ -726,7 +726,6 @@ class GoldPriceMonitor:
     # ---------- 退出 ----------
     def quit_app(self, item=None):
         self.save_config()
-        logger.info(self.config.window_x)
         logger.info("程序退出")
         if PYSTRAY_AVAILABLE and hasattr(self, 'tray_icon') and self.tray_icon is not None:
             self.tray_icon.stop()
