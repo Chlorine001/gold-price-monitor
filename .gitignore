@@ -1,2 +1,6 @@
 gold_monitor.log
 gold_config.json
+dist/
+build/
+GoldMonitor.spec
+GoldMonitor_Setup.exe
